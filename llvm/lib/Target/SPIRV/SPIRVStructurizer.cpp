@@ -14,6 +14,7 @@
 #include "SPIRVSubtarget.h"
 #include "SPIRVUtils.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/CFG.h"
@@ -28,6 +29,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
+#include <optional>
 #include <stack>
 #include <unordered_set>
 
@@ -1187,6 +1189,136 @@ class SPIRVStructurizer : public FunctionPass {
     return Modified;
   }
 
+  // If several cases converge before the switch merge, put those cases in a
+  // shared outer case construct and preserve their dispatch in a nested
+  // switch. The internal convergence is then the nested switch's merge, while
+  // the shared continuation remains inside the outer case construct.
+  bool groupSwitchCasesByInternalMerge(Function &F) {
+    DomTreeBuilder::BBDomTree DT;
+    DomTreeBuilder::BBPostDomTree PDT;
+    DT.recalculate(F);
+    PDT.recalculate(F);
+
+    for (BasicBlock &BB : F) {
+      auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
+      if (!SI || SI->getNumCases() < 2)
+        continue;
+
+      auto MergeInstructions = getMergeInstructions(BB);
+      assert(MergeInstructions.size() == 1 &&
+             "switch header must have one merge instruction");
+      BasicBlock *SwitchMerge =
+          getDesignatedMergeBlock(MergeInstructions.front());
+
+      SmallVector<std::pair<ConstantInt *, BasicBlock *>, 8> Cases;
+      for (auto &Case : SI->cases())
+        Cases.push_back({Case.getCaseValue(), Case.getCaseSuccessor()});
+
+      BasicBlock *BestMerge = nullptr;
+      SmallVector<unsigned, 8> BestGroup;
+      unsigned BestLevel = 0;
+
+      for (unsigned I = 0; I < Cases.size(); ++I) {
+        for (unsigned J = I + 1; J < Cases.size(); ++J) {
+          if (Cases[I].second == Cases[J].second)
+            continue;
+
+          BasicBlock *Merge =
+              PDT.findNearestCommonDominator(Cases[I].second, Cases[J].second);
+          if (!Merge || Merge == SwitchMerge || !DT.dominates(&BB, Merge))
+            continue;
+
+          bool IsSwitchTarget = Merge == SI->getDefaultDest();
+          for (auto &[Value, Target] : Cases)
+            IsSwitchTarget |= Merge == Target;
+          if (IsSwitchTarget)
+            continue;
+
+          SmallVector<unsigned, 8> Group;
+          SmallPtrSet<BasicBlock *, 8> GroupTargets;
+          for (unsigned K = 0; K < Cases.size(); ++K) {
+            if (!PDT.dominates(Merge, Cases[K].second))
+              continue;
+            Group.push_back(K);
+            GroupTargets.insert(Cases[K].second);
+          }
+          if (GroupTargets.size() < 2)
+            continue;
+
+          bool HasOutsidePath = false;
+          auto ReachesMerge = [&](BasicBlock *Start) {
+            bool Reaches = false;
+            visit(*Start, [&](BasicBlock *Current) {
+              if (Current == Merge) {
+                Reaches = true;
+                return false;
+              }
+              return Current != SwitchMerge;
+            });
+            return Reaches;
+          };
+
+          if (ReachesMerge(SI->getDefaultDest()))
+            HasOutsidePath = true;
+          for (unsigned K = 0; K < Cases.size() && !HasOutsidePath; ++K) {
+            if (!llvm::is_contained(Group, K) && ReachesMerge(Cases[K].second))
+              HasOutsidePath = true;
+          }
+          if (HasOutsidePath)
+            continue;
+
+          unsigned Level = PDT.getNode(Merge)->getLevel();
+          if (!BestMerge || Level > BestLevel) {
+            BestMerge = Merge;
+            BestGroup = std::move(Group);
+            BestLevel = Level;
+          }
+        }
+      }
+
+      if (!BestMerge)
+        continue;
+
+      BasicBlock *NestedDefault = BasicBlock::Create(
+          F.getContext(), "switch.case.group.default", &F, BestMerge);
+      IRBuilder<> DefaultBuilder(NestedDefault);
+      DefaultBuilder.CreateUnreachable();
+
+      BasicBlock *NestedHeader = BasicBlock::Create(
+          F.getContext(), "switch.case.group", &F, NestedDefault);
+      IRBuilder<> Builder(NestedHeader);
+      SwitchInst *NestedSwitch = Builder.CreateSwitch(
+          SI->getCondition(), NestedDefault, BestGroup.size());
+      NestedSwitch->setDebugLoc(SI->getDebugLoc());
+      Builder.SetInsertPoint(NestedSwitch);
+      auto *MergeAddress = BlockAddress::get(BestMerge->getParent(), BestMerge);
+      createOpSelectMerge(&Builder, MergeAddress);
+
+      SmallDenseSet<unsigned, 8> GroupIndices;
+      SmallPtrSet<BasicBlock *, 8> ReparentedTargets;
+      for (unsigned Index : BestGroup) {
+        GroupIndices.insert(Index);
+        NestedSwitch->addCase(Cases[Index].first, Cases[Index].second);
+
+        BasicBlock *Target = Cases[Index].second;
+        if (!ReparentedTargets.insert(Target).second)
+          continue;
+        for (PHINode &Phi : Target->phis())
+          Phi.replaceIncomingBlockWith(&BB, NestedHeader);
+      }
+
+      unsigned Index = 0;
+      for (auto &Case : SI->cases()) {
+        if (GroupIndices.contains(Index))
+          Case.setSuccessor(NestedHeader);
+        ++Index;
+      }
+      return true;
+    }
+
+    return false;
+  }
+
   // Fix switch case ordering for SPIR-V: if a case construct branches to
   // another case's target block, the branching case must immediately precede
   // the target case in the OpSwitch target list. Only non-default cases
@@ -1206,30 +1338,62 @@ class SPIRVStructurizer : public FunctionPass {
       for (auto &Case : SI->cases())
         Cases.push_back({Case.getCaseValue(), Case.getCaseSuccessor()});
 
-      // Map from target block to its case index (first occurrence only, used
-      // for fall-through detection).
-      SmallDenseMap<BasicBlock *, unsigned, 8> BlockToCaseIdx;
-      for (unsigned I = 0; I < Cases.size(); I++) {
-        // Only record the first case targeting each block.
-        BlockToCaseIdx.try_emplace(Cases[I].second, I);
+      BasicBlock *SwitchMerge = nullptr;
+      for (Instruction &I : BB) {
+        BasicBlock *Merge = getDesignatedMergeBlock(&I);
+        if (!Merge)
+          continue;
+        assert(!SwitchMerge && "switch header has multiple merge instructions");
+        SwitchMerge = Merge;
       }
+      assert(SwitchMerge && "switch header has no merge instruction");
+
+      // Map each target block to a representative case index for fall-through
+      // detection. Multiple case values may share one case construct.
+      SmallDenseMap<BasicBlock *, unsigned, 8> BlockToCaseIdx;
+      for (unsigned I = 0; I < Cases.size(); I++)
+        BlockToCaseIdx.try_emplace(Cases[I].second, I);
 
       // Build fall-through edges among cases (excluding default).
-      // FallThrough[I] = J means case I's target block branches to case J's
-      // target block, so case I must immediately precede case J.
+      // FallThrough[I] = J means a block in case construct I branches to case
+      // J's target block, so case I must immediately precede case J. Traverse
+      // the entire case construct because nested selections can hide the
+      // fall-through several blocks away from the case target.
       SmallDenseMap<unsigned, unsigned, 8> FallThrough;
       SmallDenseMap<unsigned, unsigned, 8> IncomingCount;
       for (unsigned I = 0; I < Cases.size(); I++) {
-        for (BasicBlock *Succ : successors(Cases[I].second)) {
-          if (Succ == SI->getDefaultDest())
-            continue; // Skip fall-throughs involving default.
-          auto It = BlockToCaseIdx.find(Succ);
-          if (It != BlockToCaseIdx.end() && It->second != I) {
-            FallThrough[I] = It->second;
-            IncomingCount[It->second]++;
-            break;
+        std::stack<BasicBlock *> ToVisit;
+        SmallPtrSet<BasicBlock *, 16> Seen;
+        std::optional<unsigned> FallThroughTarget;
+        ToVisit.push(Cases[I].second);
+        Seen.insert(Cases[I].second);
+
+        while (!ToVisit.empty()) {
+          BasicBlock *Current = ToVisit.top();
+          ToVisit.pop();
+
+          for (BasicBlock *Succ : successors(Current)) {
+            if (Succ == SI->getDefaultDest())
+              continue;
+
+            auto It = BlockToCaseIdx.find(Succ);
+            if (It != BlockToCaseIdx.end() && It->second != I) {
+              assert((!FallThroughTarget || *FallThroughTarget == It->second) &&
+                     "case construct falls through to multiple cases");
+              FallThroughTarget = It->second;
+              continue;
+            }
+
+            if (Succ == SwitchMerge || !Seen.insert(Succ).second)
+              continue;
+            ToVisit.push(Succ);
           }
         }
+
+        if (!FallThroughTarget)
+          continue;
+        FallThrough[I] = *FallThroughTarget;
+        IncomingCount[*FallThroughTarget]++;
       }
 
       if (FallThrough.empty())
@@ -1416,6 +1580,12 @@ public:
     // falling-through case must immediately precede the target case in the
     // OpSwitch target list.
     Modified |= fixSwitchCaseOrder(F);
+
+    // STEP 8c: Cases which converge internally cannot remain separate case
+    // constructs. Group them under nested switches whose corresponding merge
+    // is their shared convergence.
+    while (groupSwitchCasesByInternalMerge(F))
+      Modified = true;
 
     // STEP 9: sort basic blocks to match both the LLVM & SPIR-V requirements.
     Modified |= sortBlocks(F);
