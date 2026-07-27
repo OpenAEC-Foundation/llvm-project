@@ -165,6 +165,18 @@ static bool isaGEP(const Value *V) {
   return isa<StructuredGEPInst>(V) || isa<GetElementPtrInst>(V);
 }
 
+static Type *deduceElementTypeFromGEPUsers(Value *Pointer) {
+  for (User *U : Pointer->users()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U);
+    if (GEP && GEP->getPointerOperand() == Pointer)
+      return GEP->getSourceElementType();
+    auto *StructuredGEP = dyn_cast<StructuredGEPInst>(U);
+    if (StructuredGEP && StructuredGEP->getPointerOperand() == Pointer)
+      return StructuredGEP->getBaseType();
+  }
+  return nullptr;
+}
+
 // If Ty is a byte-addressing type, return the multiplier for the offset.
 // Otherwise return std::nullopt.
 static std::optional<uint64_t> getByteAddressingMultiplier(Type *Ty) {
@@ -2271,10 +2283,13 @@ void SPIRVEmitIntrinsics::insertPtrCastOrAssignTypeInstr(Instruction *I,
         if (ElemTy) {
           GR->addDeducedElementType(CalledArg, normalizeType(ElemTy));
         } else {
-          for (User *U : CalledArg->users()) {
-            if (Instruction *Inst = dyn_cast<Instruction>(U)) {
-              if ((ElemTy = deduceElementTypeHelper(Inst, false)) != nullptr)
-                break;
+          ElemTy = deduceElementTypeFromGEPUsers(CalledArg);
+          if (!ElemTy) {
+            for (User *U : CalledArg->users()) {
+              if (Instruction *Inst = dyn_cast<Instruction>(U)) {
+                if ((ElemTy = deduceElementTypeHelper(Inst, false)) != nullptr)
+                  break;
+              }
             }
           }
         }
@@ -3181,13 +3196,8 @@ void SPIRVEmitIntrinsics::processParamTypesByFunHeader(Function *F,
     // type isn't emitted with the default i8 pointee.
     if (isUntypedPointerVectorTy(Arg->getType()) &&
         !GR->findDeducedElementType(Arg)) {
-      for (User *U : Arg->users()) {
-        auto *GEP = dyn_cast<GetElementPtrInst>(U);
-        if (GEP && GEP->getPointerOperand() == Arg) {
-          GR->buildAssignPtr(B, GEP->getSourceElementType(), Arg);
-          break;
-        }
-      }
+      if (Type *ElemTy = deduceElementTypeFromGEPUsers(Arg))
+        GR->buildAssignPtr(B, ElemTy, Arg);
       continue;
     }
     if (!isUntypedPointerTy(Arg->getType()))
