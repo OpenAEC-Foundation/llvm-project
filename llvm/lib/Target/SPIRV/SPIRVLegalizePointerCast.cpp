@@ -68,6 +68,19 @@ class SPIRVLegalizePointerCastImpl {
     GR->addAssignPtrTypeInstr(Arg, AssignCI);
   }
 
+  Type *getLogicalType(Value *V) {
+    auto *AssignType =
+        dyn_cast_or_null<IntrinsicInst>(GR->findAssignPtrTypeInstr(V));
+    if (!AssignType ||
+        AssignType->getIntrinsicID() != Intrinsic::spv_assign_type)
+      return V->getType();
+    // Aggregate values use i32 placeholders until IR translation. Their
+    // assigned type is the type that must be matched against memory.
+    auto *TypeMetadata =
+        cast<MetadataAsValue>(AssignType->getArgOperand(1))->getMetadata();
+    return cast<ConstantAsMetadata>(TypeMetadata)->getType();
+  }
+
   static FixedVectorType *makeVectorFromTotalBits(Type *ElemTy,
                                                   TypeSize TotalBits) {
     unsigned ElemBits = ElemTy->getScalarSizeInBits();
@@ -469,19 +482,20 @@ class SPIRVLegalizePointerCastImpl {
   // memory layouts to find a compatible type.
   void buildLegalizedStore(IRBuilder<> &B, Value *Src, Value *Dst,
                            Align Alignment) {
-    auto ResultOpt = getPointerToFirstCompatibleType(B, Dst, Dst->getType(),
-                                                     Src->getType(), true);
+    Type *SrcType = getLogicalType(Src);
+    auto ResultOpt =
+        getPointerToFirstCompatibleType(B, Dst, Dst->getType(), SrcType, true);
     assert(ResultOpt && "Failed to store to aggregate: "
                         "Could not find compatible memory layout.");
     auto [GEP, CurrentTy] = *ResultOpt;
 
     auto *DAT = dyn_cast<ArrayType>(CurrentTy);
     auto *DVT = dyn_cast<FixedVectorType>(CurrentTy);
-    auto *SVT = dyn_cast<FixedVectorType>(Src->getType());
+    auto *SVT = dyn_cast<FixedVectorType>(SrcType);
     auto *DMAT =
         DAT ? dyn_cast<FixedVectorType>(DAT->getElementType()) : nullptr;
 
-    if (Src->getType() == CurrentTy) {
+    if (SrcType == CurrentTy) {
       StoreInst *SI = B.CreateStore(Src, GEP);
       SI->setAlignment(Alignment);
       return;
