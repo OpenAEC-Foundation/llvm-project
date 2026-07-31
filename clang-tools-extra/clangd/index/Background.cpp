@@ -93,13 +93,12 @@ bool shardIsStale(const LoadedShard &LS, llvm::vfs::FileSystem *FS) {
 
 llvm::Expected<BackgroundIndex::IndexedFile>
 indexedFile(PathRef File, PathRef DependentTU, const IncludeGraphNode &Source,
-            PathRef HintPath, bool HasConditionalIncludes) {
+            PathRef HintPath) {
   BackgroundIndex::IndexedFile Result;
   Result.File = File.str();
   Result.DependentTU = DependentTU.str();
   Result.Digest = Source.Digest;
   Result.Flags = Source.Flags;
-  Result.HasConditionalIncludes = HasConditionalIncludes;
   for (llvm::StringRef IncludedURI : Source.DirectIncludes) {
     auto Included = URI::resolve(IncludedURI, HintPath);
     if (!Included)
@@ -368,20 +367,17 @@ void BackgroundIndex::update(
     if (!Conditional) {
       GraphErrors[*AbsPath] = llvm::toString(Conditional.takeError());
     } else {
-      bool HasConditionalIncludes = !Conditional->empty();
-      auto File = indexedFile(*AbsPath, MainFile, IGN, MainFile,
-                              HasConditionalIncludes);
+      auto ContextSource = ContextSources.find(IGN.URI);
+      assert(ContextSource != ContextSources.end());
+      if (!Conditional->empty())
+        ContextSource->getValue().Flags |=
+            IncludeGraphNode::SourceFlag::HasConditionalIncludes;
+      auto File = indexedFile(*AbsPath, MainFile, ContextSource->getValue(),
+                              MainFile);
       if (!File)
         GraphErrors[*AbsPath] = llvm::toString(File.takeError());
-      else {
+      else
         Contexts.push_back(std::move(*File));
-        if (HasConditionalIncludes) {
-          auto ContextSource = ContextSources.find(IGN.URI);
-          assert(ContextSource != ContextSources.end());
-          ContextSource->getValue().Flags |=
-              IncludeGraphNode::SourceFlag::HasConditionalIncludes;
-        }
-      }
     }
     const auto DigestIt = ShardVersionsSnapshot.find(*AbsPath);
     // File has different contents, or indexing was successful this time.
@@ -670,10 +666,8 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles,
             Complete = false;
             break;
           }
-          auto Context = indexedFile(
-              *AbsPath, LS.AbsolutePath, Source.getValue(), LS.AbsolutePath,
-              Source.getValue().Flags &
-                  IncludeGraphNode::SourceFlag::HasConditionalIncludes);
+          auto Context = indexedFile(*AbsPath, LS.AbsolutePath,
+                                     Source.getValue(), LS.AbsolutePath);
           if (!Context) {
             Complete = false;
             break;

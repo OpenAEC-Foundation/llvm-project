@@ -27,6 +27,7 @@
 #include "gtest/gtest.h"
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -75,7 +76,8 @@ TEST(GlobalCompilationDatabaseTest, FallbackWorkingDirectory) {
 
 static tooling::CompileCommand cmd(llvm::StringRef File, llvm::StringRef Arg) {
   return tooling::CompileCommand(
-      testRoot(), File, {"clang", std::string(Arg), std::string(File)}, "");
+      testRoot(), File,
+      {"clang", "-c", std::string(Arg), std::string(File)}, "");
 }
 
 class OverlayCDBTest : public ::testing::Test {
@@ -124,7 +126,8 @@ TEST_F(OverlayCDBTest, GetCompileCommand) {
 TEST_F(OverlayCDBTest, GetFallbackCommand) {
   OverlayCDB CDB(Base.get(), {"-DA=4"});
   EXPECT_THAT(CDB.getFallbackCommand(testPath("bar.cc")).CommandLine,
-              ElementsAre("clang", "-DA=2", testPath("bar.cc"), "-DA=4"));
+              ElementsAre("clang", "-c", "-DA=2", testPath("bar.cc"),
+                          "-DA=4"));
 }
 
 TEST_F(OverlayCDBTest, NoBase) {
@@ -218,7 +221,7 @@ TEST_F(OverlayCDBTest, FileRenameMapsProxyKeyAndSourceIndependently) {
   EXPECT_THAT(Migrated->CommandLine, Contains(NewSource));
 }
 
-TEST_F(OverlayCDBTest, FileRenameRejectsCompileCommandCollision) {
+TEST_F(OverlayCDBTest, FileRenameInvalidatesCompileCommandCollision) {
   OverlayCDB CDB(nullptr);
   ASSERT_TRUE(
       CDB.setCompileCommand(testPath("a.cc"), cmd(testPath("a.cc"), "-DA")));
@@ -227,18 +230,87 @@ TEST_F(OverlayCDBTest, FileRenameRejectsCompileCommandCollision) {
 
   const std::vector<std::pair<Path, Path>> Renames = {
       {testPath("a.cc"), testPath("b.cc")}};
-  EXPECT_THAT_ERROR(
+  ASSERT_THAT_ERROR(
       CDB.prepareFileRenames(
           Renames, {{testPath("a.cc"), cmd(testPath("a.cc"), "-DA")},
                     {testPath("b.cc"), cmd(testPath("b.cc"), "-DB")}}),
-      llvm::Failed());
-  EXPECT_TRUE(CDB.getCompileCommand(testPath("a.cc")));
-  EXPECT_TRUE(CDB.getCompileCommand(testPath("b.cc")));
+      llvm::Succeeded());
+  ASSERT_THAT_ERROR(CDB.filesRenamed(Renames), llvm::Succeeded());
+  EXPECT_FALSE(CDB.getCompileCommand(testPath("a.cc")));
+  EXPECT_FALSE(CDB.getCompileCommand(testPath("b.cc")));
 }
 
-TEST_F(OverlayCDBTest, UnpreparedRenameDropsUnprovenCommands) {
+TEST_F(OverlayCDBTest, FileRenameInvalidatesOnlyUnprovableCommands) {
+  OverlayCDB CDB(nullptr);
+  const Path Affected = testPath("old/main.cc");
+  const Path Destination = testPath("new/main.cc");
+  const Path Preserved = testPath("preserved.cc");
+  const Path Uncertain = testPath("uncertain.cc");
+  auto Good = cmd(Affected, "-DGOOD");
+  auto Unrelated = cmd(Preserved, "-DPRESERVED");
+  auto Response = cmd(Uncertain, "@unknown.rsp");
+  Response.HadResponseFile = true;
+  ASSERT_TRUE(CDB.setCompileCommand(Affected, Good));
+  ASSERT_TRUE(CDB.setCompileCommand(Preserved, Unrelated));
+  ASSERT_TRUE(CDB.setCompileCommand(Uncertain, Response));
+
+  ASSERT_THAT_ERROR(CDB.filesRenamed({{testPath("old"), testPath("new")}}),
+                    llvm::Succeeded());
+  EXPECT_FALSE(CDB.getCompileCommand(Affected));
+  EXPECT_TRUE(CDB.getCompileCommand(Destination));
+  EXPECT_EQ(CDB.getCompileCommand(Preserved), Unrelated);
+  EXPECT_FALSE(CDB.getCompileCommand(Uncertain));
+}
+
+TEST_F(OverlayCDBTest, ExposesPreparedDestinationCommandWithoutCommitting) {
+  OverlayCDB CDB(nullptr);
+  const Path OldFile = testPath("old.cc");
+  const Path NewFile = testPath("new.cc");
+  auto Command = cmd(OldFile, "-DPREVIEW");
+  ASSERT_TRUE(CDB.setCompileCommand(OldFile, Command));
+  const std::vector<std::pair<Path, Path>> Renames = {{OldFile, NewFile}};
+  ASSERT_THAT_ERROR(CDB.prepareFileRenames(Renames, {{OldFile, Command}}),
+                    llvm::Succeeded());
+
+  EXPECT_FALSE(CDB.getCompileCommand(NewFile));
+  auto Preview = CDB.getCompileCommandAfterPreparedFileRenames(NewFile);
+  ASSERT_TRUE(Preview);
+  EXPECT_THAT(Preview->CommandLine, Contains(NewFile));
+  EXPECT_TRUE(CDB.getCompileCommand(OldFile));
+  CDB.discardPreparedFileRenames();
+  EXPECT_FALSE(CDB.getCompileCommandAfterPreparedFileRenames(NewFile));
+}
+
+TEST_F(OverlayCDBTest, PreparedRenamePreservesUnvalidatedCommands) {
   OverlayCDB CDB(nullptr);
   const Path OldFile = testPath("old/main.cc");
+  const Path NewFile = testPath("new/main.cc");
+  const Path UnrelatedFile = testPath("unrelated.cc");
+  auto Renamed = cmd(OldFile, "-DRENAMED");
+  auto Unrelated = cmd(UnrelatedFile, "-DUNRELATED");
+  ASSERT_TRUE(CDB.setCompileCommand(OldFile, Renamed));
+  ASSERT_TRUE(CDB.setCompileCommand(UnrelatedFile, Unrelated));
+  std::vector<std::vector<std::string>> Changes;
+  auto Sub = CDB.watch(
+      [&](const std::vector<std::string> &Files) { Changes.push_back(Files); });
+
+  const std::vector<std::pair<Path, Path>> Renames = {
+      {testPath("old"), testPath("new")}};
+  ASSERT_THAT_ERROR(CDB.prepareFileRenames(Renames, {{OldFile, Renamed}}),
+                    llvm::Succeeded());
+  ASSERT_THAT_ERROR(CDB.filesRenamed(Renames), llvm::Succeeded());
+
+  EXPECT_FALSE(CDB.getCompileCommand(OldFile));
+  ASSERT_TRUE(CDB.getCompileCommand(NewFile));
+  EXPECT_EQ(CDB.getCompileCommand(UnrelatedFile), Unrelated);
+  ASSERT_EQ(Changes.size(), 1u);
+  EXPECT_THAT(Changes.front(), UnorderedElementsAre(OldFile, NewFile));
+}
+
+TEST_F(OverlayCDBTest, UnpreparedRenameMigratesCompileCommands) {
+  OverlayCDB CDB(nullptr);
+  const Path OldFile = testPath("old/main.cc");
+  const Path NewFile = testPath("new/main.cc");
   auto Command = cmd(OldFile, "-I" + testPath("alias"));
   ASSERT_TRUE(CDB.setCompileCommand(OldFile, Command));
   std::vector<std::vector<std::string>> Changes;
@@ -248,10 +320,9 @@ TEST_F(OverlayCDBTest, UnpreparedRenameDropsUnprovenCommands) {
   ASSERT_THAT_ERROR(CDB.filesRenamed({{testPath("old"), testPath("new")}}),
                     llvm::Succeeded());
   EXPECT_FALSE(CDB.getCompileCommand(OldFile));
-  EXPECT_FALSE(CDB.getCompileCommand(testPath("new/main.cc")));
+  EXPECT_TRUE(CDB.getCompileCommand(NewFile));
   ASSERT_EQ(Changes.size(), 1u);
-  EXPECT_THAT(Changes.front(),
-              UnorderedElementsAre(OldFile, testPath("new/main.cc")));
+  EXPECT_THAT(Changes.front(), UnorderedElementsAre(OldFile, NewFile));
 }
 
 TEST_F(OverlayCDBTest, MutationInvalidatesPreparedRename) {
@@ -268,7 +339,44 @@ TEST_F(OverlayCDBTest, MutationInvalidatesPreparedRename) {
 
   ASSERT_THAT_ERROR(CDB.filesRenamed(Renames), llvm::Succeeded());
   EXPECT_FALSE(CDB.getCompileCommand(OldFile));
-  EXPECT_FALSE(CDB.getCompileCommand(testPath("new/main.cc")));
+  auto Migrated = CDB.getCompileCommand(testPath("new/main.cc"));
+  ASSERT_TRUE(Migrated);
+  EXPECT_THAT(Migrated->CommandLine, Contains("-I" + testPath("alias")));
+}
+
+TEST_F(OverlayCDBTest, RebuildsPlanAfterMutationDuringDelegateCommit) {
+  class MutatingCDB : public GlobalCompilationDatabase {
+  public:
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef) const override {
+      return std::nullopt;
+    }
+    llvm::Error
+    filesRenamed(llvm::ArrayRef<std::pair<Path, Path>>) const override {
+      if (OnRename)
+        OnRename();
+      return llvm::Error::success();
+    }
+    mutable std::function<void()> OnRename;
+  } Base;
+
+  OverlayCDB CDB(&Base);
+  const Path OldFile = testPath("old.cc");
+  const Path NewFile = testPath("new.cc");
+  const Path AddedFile = testPath("added.cc");
+  auto Original = cmd(OldFile, "-DORIGINAL");
+  auto Added = cmd(AddedFile, "-DADDED");
+  ASSERT_TRUE(CDB.setCompileCommand(OldFile, Original));
+  Base.OnRename = [&] {
+    Base.OnRename = nullptr;
+    ASSERT_TRUE(CDB.setCompileCommand(AddedFile, Added));
+  };
+
+  ASSERT_THAT_ERROR(CDB.filesRenamed({{OldFile, NewFile}}),
+                    llvm::Succeeded());
+  EXPECT_FALSE(CDB.getCompileCommand(OldFile));
+  EXPECT_TRUE(CDB.getCompileCommand(NewFile));
+  EXPECT_EQ(CDB.getCompileCommand(AddedFile), Added);
 }
 
 TEST_F(OverlayCDBTest, PreparationRejectsChangedProvenance) {
@@ -345,7 +453,7 @@ TEST_F(OverlayCDBTest, DiscardedPreparationFailsClosed) {
   CDB.discardPreparedFileRenames();
   ASSERT_THAT_ERROR(CDB.filesRenamed(Renames), llvm::Succeeded());
   EXPECT_FALSE(CDB.getCompileCommand(OldFile));
-  EXPECT_FALSE(CDB.getCompileCommand(testPath("new.cc")));
+  EXPECT_TRUE(CDB.getCompileCommand(testPath("new.cc")));
 }
 
 TEST_F(OverlayCDBTest, FailedPreparationInvalidatesOlderPlan) {
@@ -365,7 +473,7 @@ TEST_F(OverlayCDBTest, FailedPreparationInvalidatesOlderPlan) {
                     llvm::Failed());
   ASSERT_THAT_ERROR(CDB.filesRenamed(FirstRename), llvm::Succeeded());
   EXPECT_FALSE(CDB.getCompileCommand(OldFile));
-  EXPECT_FALSE(CDB.getCompileCommand(testPath("first.cc")));
+  EXPECT_TRUE(CDB.getCompileCommand(testPath("first.cc")));
 }
 
 TEST_F(OverlayCDBTest, DelegateFailureDoesNotPreserveMismatchedPlan) {
@@ -399,7 +507,7 @@ TEST_F(OverlayCDBTest, DelegateFailureDoesNotPreserveMismatchedPlan) {
   Base.Fail = false;
   ASSERT_THAT_ERROR(CDB.filesRenamed(FirstRename), llvm::Succeeded());
   EXPECT_FALSE(CDB.getCompileCommand(OldFile));
-  EXPECT_FALSE(CDB.getCompileCommand(testPath("first.cc")));
+  EXPECT_TRUE(CDB.getCompileCommand(testPath("first.cc")));
 }
 
 TEST_F(OverlayCDBTest, EmptyAndIdentityRenamesAreNoOps) {
@@ -426,8 +534,9 @@ TEST_F(OverlayCDBTest, Adjustments) {
                  });
   // Command from underlying gets adjusted.
   auto Cmd = *CDB.getCompileCommand(testPath("foo.cc"));
-  EXPECT_THAT(Cmd.CommandLine, ElementsAre("clang", "-DA=1", testPath("foo.cc"),
-                                           "-DAdjust_foo.cc"));
+  EXPECT_THAT(Cmd.CommandLine,
+              ElementsAre("clang", "-c", "-DA=1", testPath("foo.cc"),
+                          "-DAdjust_foo.cc"));
 
   // Command from overlay gets adjusted.
   tooling::CompileCommand BarCommand;
@@ -441,8 +550,9 @@ TEST_F(OverlayCDBTest, Adjustments) {
 
   // Fallback gets adjusted.
   Cmd = CDB.getFallbackCommand("baz.cc");
-  EXPECT_THAT(Cmd.CommandLine, ElementsAre("clang", "-DA=2", "baz.cc",
-                                           "-DFallback", "-DAdjust_baz.cc"));
+  EXPECT_THAT(Cmd.CommandLine,
+              ElementsAre("clang", "-c", "-DA=2", "baz.cc", "-DFallback",
+                          "-DAdjust_baz.cc"));
 }
 
 TEST_F(OverlayCDBTest, ExpandedResponseFiles) {

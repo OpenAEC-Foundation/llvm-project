@@ -1,6 +1,6 @@
 # RUN: rm -rf %t
 # RUN: split-file %s %t
-# RUN: sed -e "s|DIRECTORY|%/t|g" -e "s|CLANG|%clang|g" \
+# RUN: sed -e "s|DIRECTORY|%/t|g" \
 # RUN:   %t/compile_commands.json.in > %t/compile_commands.json
 # RUN: sed -e "s|DIRECTORY|%/t|g" %t/requests.jsonrpc.in \
 # RUN:   > %t/requests.jsonrpc
@@ -11,19 +11,18 @@
 [
   {
     "directory": "DIRECTORY",
-    "command": "CLANG -I DIRECTORY -c DIRECTORY/main.cpp",
+    "command": "clang -I DIRECTORY -c DIRECTORY/main.cpp",
     "file": "DIRECTORY/main.cpp"
   },
   {
     "directory": "DIRECTORY",
-    "command": "CLANG -I DIRECTORY -c DIRECTORY/open.cpp",
+    "command": "clang -I DIRECTORY -c DIRECTORY/open.cpp",
     "file": "DIRECTORY/open.cpp"
   }
 ]
 
 #--- old.h
 inline int answer() { return 42; }
-
 #--- main.cpp
 #include "old.h"
 int main() { return answer(); }

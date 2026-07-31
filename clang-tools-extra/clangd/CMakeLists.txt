@@ -85,6 +85,7 @@ add_clang_library(clangDaemon STATIC
   FeatureModule.cpp
   Feature.cpp
   FileRename.cpp
+  FileRenameDirectives.cpp
   FileRenameOptions.cpp
   WorkspaceSourceCache.cpp
   FindSymbols.cpp

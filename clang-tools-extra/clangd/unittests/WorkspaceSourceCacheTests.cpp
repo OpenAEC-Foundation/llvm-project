@@ -21,6 +21,7 @@
 #include <memory>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace clang {
 namespace clangd {
@@ -44,6 +45,63 @@ public:
 
 private:
   Path FailPath;
+};
+
+class BufferSizeRecordingFile : public llvm::vfs::File {
+public:
+  BufferSizeRecordingFile(std::unique_ptr<llvm::vfs::File> Base,
+                          std::vector<int64_t> &RequestedSizes)
+      : Base(std::move(Base)), RequestedSizes(RequestedSizes) {}
+
+  llvm::ErrorOr<llvm::vfs::Status> status() override {
+    return Base->status();
+  }
+
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
+  getBuffer(const llvm::Twine &Name, int64_t FileSize,
+            bool RequiresNullTerminator, bool IsVolatile) override {
+    RequestedSizes.push_back(FileSize);
+    return Base->getBuffer(Name, FileSize, RequiresNullTerminator, IsVolatile);
+  }
+
+  std::error_code close() override { return Base->close(); }
+
+private:
+  std::unique_ptr<llvm::vfs::File> Base;
+  std::vector<int64_t> &RequestedSizes;
+};
+
+class BufferSizeRecordingFileSystem : public llvm::vfs::ProxyFileSystem {
+public:
+  explicit BufferSizeRecordingFileSystem(
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> Base)
+      : ProxyFileSystem(std::move(Base)) {}
+
+  llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>>
+  openFileForRead(const llvm::Twine &Path) override {
+    ++TextOpens;
+    return open(Path);
+  }
+
+  llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>>
+  openFileForReadBinary(const llvm::Twine &Path) override {
+    ++BinaryOpens;
+    return open(Path);
+  }
+
+  unsigned TextOpens = 0;
+  unsigned BinaryOpens = 0;
+  std::vector<int64_t> RequestedSizes;
+
+private:
+  llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>>
+  open(const llvm::Twine &Path) {
+    auto File = ProxyFileSystem::openFileForRead(Path);
+    if (!File)
+      return File.getError();
+    return std::make_unique<BufferSizeRecordingFile>(std::move(*File),
+                                                      RequestedSizes);
+  }
 };
 
 TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
@@ -127,6 +185,27 @@ TEST(FileRename, EnforcesWorkspaceInventoryFileSizeLimit) {
   ASSERT_THAT_EXPECTED(Snapshot, llvm::Succeeded());
   EXPECT_EQ(Snapshot->Files.lookup(Binary).Classification,
             WorkspaceFileClassification::Binary);
+}
+
+TEST(FileRename, ProbesOversizedFilesWithoutReadingThemWhole) {
+  constexpr uint64_t ProbeBytes = 64 * 1024;
+  WorkspaceSourceLimits Limits;
+  Limits.MaxTextFileBytes = ProbeBytes;
+  const Path Binary = testPath("giant.cpp");
+  MockFS FS;
+  FS.Files[Binary] = std::string(4 * ProbeBytes, 'x');
+  FS.Files[Binary][ProbeBytes - 1] = '\0';
+  llvm::IntrusiveRefCntPtr<BufferSizeRecordingFileSystem> VFS =
+      new BufferSizeRecordingFileSystem(FS.view(std::nullopt));
+
+  WorkspaceSourceCache Cache(testRoot(), Limits);
+  auto Snapshot = Cache.snapshot(*VFS);
+  ASSERT_THAT_EXPECTED(Snapshot, llvm::Succeeded());
+  EXPECT_EQ(Snapshot->Files.lookup(Binary).Classification,
+            WorkspaceFileClassification::Binary);
+  ASSERT_THAT(VFS->RequestedSizes, ElementsAre(ProbeBytes));
+  EXPECT_EQ(VFS->BinaryOpens, 1U);
+  EXPECT_EQ(VFS->TextOpens, 0U);
 }
 
 TEST(FileRename, EnforcesWorkspaceInventoryAggregateLimits) {

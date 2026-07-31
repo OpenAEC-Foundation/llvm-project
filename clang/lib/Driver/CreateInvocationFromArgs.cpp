@@ -79,6 +79,8 @@ createInvocation(ArrayRef<const char *> ArgList, CreateInvocationOptions Opts) {
   // particular job, it should be controlled via options (e.g.
   // --cuda-{host|device}-only for CUDA) passed to the driver.
   const driver::JobList &Jobs = C->getJobs();
+  if (Opts.DriverJobCount)
+    *Opts.DriverJobCount = Jobs.size();
   bool OffloadCompilation = false;
   if (Jobs.size() > 1) {
     for (auto &A : C->getActions()) {

@@ -10,12 +10,15 @@
 #include "FileRename.h"
 #include "FileRenameInternal.h"
 #include "support/Logger.h"
+#include "clang/Driver/ToolChain.h"
 #include "clang/Options/Options.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+#include "llvm/TargetParser/Triple.h"
 #include <functional>
 #include <system_error>
 
@@ -27,7 +30,6 @@ enum class PathSemantics {
   None,
   Path,
   TreeRoot,
-  ModuleFile,
   RemapPair,
   ZOSList,
   IncludePrefix,
@@ -35,6 +37,8 @@ enum class PathSemantics {
   WithSysroot,
   CommandInput,
   HeaderSpelling,
+  PathList,
+  ImplicitProfile,
 };
 
 PathSemantics pathSemantics(unsigned ID) {
@@ -43,8 +47,6 @@ PathSemantics pathSemantics(unsigned ID) {
   case OPT_I:
   case OPT_F:
   case OPT_embed_dir_EQ:
-  case OPT_fmodule_map_file:
-  case OPT_fprebuilt_module_path:
   case OPT_fmodules_cache_path:
   case OPT_fmodules_user_build_path:
   case OPT_iquote:
@@ -52,11 +54,6 @@ PathSemantics pathSemantics(unsigned ID) {
   case OPT_isystem_after:
   case OPT_idirafter:
   case OPT_iframework:
-  case OPT_iapinotes_modules:
-  case OPT_ivfsoverlay:
-  case OPT_vfsoverlay:
-  case OPT_working_directory:
-  case OPT_working_directory_EQ:
   case OPT_c_isystem:
   case OPT_cxx_isystem:
   case OPT_objc_isystem:
@@ -70,20 +67,35 @@ PathSemantics pathSemantics(unsigned ID) {
   case OPT_fmodules_embed_file_EQ:
   case OPT_warning_suppression_mappings_EQ:
   case OPT_multi_lib_config:
-  case OPT_fplugin_EQ:
-  case OPT_fpass_plugin_EQ:
-  case OPT_hipspv_pass_plugin_EQ:
-  case OPT_hip_device_lib_EQ:
-  case OPT_rocm_device_lib_path_EQ:
-  case OPT_libomptarget_amdgpu_bc_path_EQ:
-  case OPT_libomptarget_nvptx_bc_path_EQ:
-  case OPT_libomptarget_spirv_bc_path_EQ:
-  case OPT_ast_merge:
   case OPT_foverride_record_layout_EQ:
-  case OPT_load:
   case OPT_ccc_gcc_name:
-  case OPT__SLASH_Fp:
+  case OPT_fembed_offload_object_EQ:
+  case OPT_fprofile_sample_use_EQ:
+  case OPT_fprofile_instr_use_EQ:
+  case OPT_fprofile_remapping_file_EQ:
+  case OPT_fprofile_list_EQ:
+  case OPT_fcodegen_data_use_EQ:
+  case OPT_fsanitize_ignorelist_EQ:
+  case OPT_fsanitize_system_ignorelist_EQ:
+  case OPT_fsanitize_coverage_allowlist:
+  case OPT_fsanitize_coverage_ignorelist:
+  case OPT_fexperimental_sanitize_metadata_ignorelist_EQ:
+  case OPT_frandomize_layout_seed_file_EQ:
+  case OPT_fxray_always_instrument:
+  case OPT_fxray_never_instrument:
+  case OPT_fxray_attr_list:
+  case OPT_fms_secure_hotpatch_functions_file:
+  case OPT_fthinlto_index_EQ:
+  case OPT_mlink_builtin_bitcode:
+  case OPT_mlink_bitcode_file:
+  case OPT_fprofile_instrument_use_path_EQ:
+  case OPT_fcuda_include_gpubinary:
+  case OPT_fopenmp_host_ir_file_path:
     return PathSemantics::Path;
+  case OPT_extract_api_ignores_EQ:
+    return PathSemantics::PathList;
+  case OPT_fprofile_instr_use:
+    return PathSemantics::ImplicitProfile;
   case OPT_B:
   case OPT_gcc_toolchain:
   case OPT_gcc_install_dir_EQ:
@@ -104,9 +116,10 @@ PathSemantics pathSemantics(unsigned ID) {
   case OPT__SLASH_winsysroot:
   case OPT_config_system_dir_EQ:
   case OPT_config_user_dir_EQ:
+  case OPT_fprofile_use_EQ:
+  case OPT_fmemory_profile_use_EQ:
+  case OPT_iapinotes_modules:
     return PathSemantics::TreeRoot;
-  case OPT_fmodule_file:
-    return PathSemantics::ModuleFile;
   case OPT_remap_file:
     return PathSemantics::RemapPair;
   case OPT_mzos_sys_include_EQ:
@@ -120,9 +133,7 @@ PathSemantics pathSemantics(unsigned ID) {
   case OPT_iframeworkwithsysroot:
     return PathSemantics::WithSysroot;
   case OPT_include:
-  case OPT_include_pch:
   case OPT_imacros:
-  case OPT_chain_include:
     return PathSemantics::CommandInput;
   case OPT_pch_through_header_EQ:
   case OPT__SLASH_Yc:
@@ -143,6 +154,119 @@ bool isForwardedByResolvedJob(const llvm::opt::Arg &Arg) {
          Arg.getOption().matches(OPT_Xoffload_compiler);
 }
 
+bool isPluginOption(unsigned ID) {
+  using namespace options;
+  switch (ID) {
+  case OPT_fplugin_EQ:
+  case OPT_fplugin_arg:
+  case OPT_fpass_plugin_EQ:
+  case OPT_hipspv_pass_plugin_EQ:
+  case OPT_load:
+  case OPT_plugin:
+  case OPT_plugin_arg:
+  case OPT_add_plugin:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool isPrecompiledInputOption(unsigned ID) {
+  using namespace options;
+  switch (ID) {
+  case OPT_include_pch:
+  case OPT_fmodule_file:
+  case OPT_fprebuilt_module_path:
+  case OPT_ast_merge:
+  case OPT_chain_include:
+  case OPT__SLASH_Fp:
+  case OPT__SLASH_Yu:
+  case OPT_fmodule_map_file:
+  case OPT_ivfsoverlay:
+  case OPT_vfsoverlay:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool isOpaqueForwardingOption(unsigned ID) {
+  using namespace options;
+  switch (ID) {
+  case OPT_mllvm:
+  case OPT_mmlir:
+  case OPT_Xassembler:
+  case OPT_Wa_COMMA:
+  case OPT_Xclangas:
+  case OPT_Xcuda_fatbinary:
+  case OPT_Xcuda_ptxas:
+  case OPT_Xlinker:
+  case OPT_Wl_COMMA:
+  case OPT_Xthinlto_distributor_EQ:
+  case OPT_Xoffload_compiler:
+  case OPT_Xoffload_linker:
+  case OPT_T:
+  case OPT_hip_device_lib_EQ:
+  case OPT_rocm_device_lib_path_EQ:
+  case OPT_libomptarget_amdgpu_bc_path_EQ:
+  case OPT_libomptarget_nvptx_bc_path_EQ:
+  case OPT_libomptarget_spirv_bc_path_EQ:
+  case OPT_fuse_ld_EQ:
+  case OPT_ld_path_EQ:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool isClangDriverName(llvm::StringRef Executable) {
+  driver::ParsedClangName Parsed =
+      driver::ToolChain::getTargetAndModeFromProgramName(Executable);
+  if (Parsed.isEmpty() || (!Parsed.TargetPrefix.empty() &&
+                           llvm::Triple(Parsed.TargetPrefix).getArch() ==
+                               llvm::Triple::UnknownArch))
+    return false;
+  return llvm::is_contained(
+      llvm::ArrayRef<llvm::StringLiteral>{
+          "clang", "clang++", "clang-c++", "clang-cc", "clang-cpp",
+          "clang-g++", "clang-gcc", "clang-cl"},
+      Parsed.ModeSuffix);
+}
+
+bool isAmbiguousDriverName(llvm::StringRef Executable) {
+  driver::ParsedClangName Parsed =
+      driver::ToolChain::getTargetAndModeFromProgramName(Executable);
+  return !Parsed.isEmpty() &&
+         llvm::is_contained(
+             llvm::ArrayRef<llvm::StringLiteral>{"cc", "c++", "cpp", "cl"},
+             Parsed.ModeSuffix);
+}
+
+bool hasCompileOnlyAction(const tooling::CompileCommand &Command,
+                          CompilerInvocationMode Mode) {
+  unsigned FirstArg = Mode == CompilerInvocationMode::DirectCC1 ? 2 : 1;
+  if (Command.CommandLine.size() < FirstArg)
+    return false;
+  llvm::SmallVector<const char *> Raw;
+  for (llvm::StringRef Arg :
+       llvm::ArrayRef(Command.CommandLine).drop_front(FirstArg))
+    Raw.push_back(Arg.data());
+  unsigned MissingIndex = 0;
+  unsigned MissingCount = 0;
+  auto Parsed = getDriverOptTable().ParseArgs(
+      Raw, MissingIndex, MissingCount,
+      llvm::opt::Visibility(Mode == CompilerInvocationMode::ClangCL
+                                ? options::CLOption
+                            : Mode == CompilerInvocationMode::DirectCC1
+                                ? options::CC1Option
+                                : options::ClangOption));
+  return MissingCount == 0 &&
+         Parsed.hasArg(options::OPT_c, options::OPT_S, options::OPT_E,
+                       options::OPT_M, options::OPT_MM,
+                       options::OPT_fsyntax_only, options::OPT__SLASH_Zs,
+                       options::OPT__SLASH_EP, options::OPT__SLASH_P);
+}
+
 } // namespace
 
 llvm::Error validateCompileCommandForRenames(
@@ -154,30 +278,61 @@ llvm::Error validateCompileCommandForRenames(
   assert((FS || ExpandedRenames.empty()) &&
          "expanded renames require a filesystem");
 
+  if (Command.CommandLine.empty())
+    return error("compiler command line is empty");
+  if (Command.HadResponseFile)
+    return error("cannot prove compiler response-file expansion after rename");
+  if (Command.HadConfigFile)
+    return error("cannot prove compiler configuration-file expansion after "
+                 "rename");
+  if (!llvm::sys::path::is_absolute(Command.Directory))
+    return error("compilation working directory is not absolute: {0}",
+                 Command.Directory);
+
+  auto Normalized = normalizeCompilerCommand(Command);
+  if (!Normalized)
+    return Normalized.takeError();
+  if (!hasCompileOnlyAction(Command, Normalized->Mode))
+    return error("file rename requires a compile-only command");
+
   llvm::SmallVector<Path> CanonicalOldPaths;
+  llvm::SmallVector<Path> CanonicalNewPaths;
   if (FS) {
     CanonicalOldPaths.reserve(Renames.size());
+    CanonicalNewPaths.reserve(Renames.size() + ExpandedRenames.size());
     for (const auto &Rename : Renames) {
       auto Canonical = fileRenameCanonicalPath(Rename.first, *FS);
       if (!Canonical)
         return Canonical.takeError();
       CanonicalOldPaths.push_back(std::move(*Canonical));
+      Canonical = fileRenameCanonicalPath(Rename.second, *FS);
+      if (!Canonical)
+        return Canonical.takeError();
+      CanonicalNewPaths.push_back(std::move(*Canonical));
+    }
+    for (const auto &Rename : ExpandedRenames) {
+      auto Canonical = fileRenameCanonicalPath(Rename.NewPath, *FS);
+      if (!Canonical)
+        return Canonical.takeError();
+      CanonicalNewPaths.push_back(std::move(*Canonical));
     }
   }
 
-  auto CheckPath = [&](llvm::StringRef Value, llvm::StringRef Option,
-                       bool IncludesDescendants = false) -> llvm::Error {
+  auto CheckPathFrom = [&](llvm::StringRef Value, PathRef BaseDirectory,
+                           llvm::StringRef Option,
+                           bool IncludesDescendants = false) -> llvm::Error {
     if (Value.empty())
       return error("compiler option {0} has an empty path", Option);
     llvm::SmallString<256> Absolute(Value);
     if (!llvm::sys::path::is_absolute(Absolute)) {
-      Absolute = Command.Directory;
+      Absolute = BaseDirectory;
       llvm::sys::path::append(Absolute, Value);
     }
     llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
     if (IncludesDescendants)
       for (const auto &Rename : Renames)
-        if (fileRenamePathInside(Absolute, Rename.first))
+        if (fileRenamePathInside(Absolute, Rename.first) ||
+            fileRenamePathInside(Absolute, Rename.second))
           return error("file rename moves compiler path {0} from option {1}",
                        Absolute, Option);
     auto Mapped = mapPathAfterRenames(Absolute, Renames);
@@ -197,6 +352,14 @@ llvm::Error validateCompileCommandForRenames(
           (IncludesDescendants && fileRenamePathInside(*Canonical, Old)))
         return error("file rename moves compiler path {0} from option {1}",
                      Absolute, Option);
+    for (PathRef New : CanonicalNewPaths)
+      if (pathEqual(*Canonical, New) ||
+          (IncludesDescendants &&
+           (fileRenamePathInside(*Canonical, New) ||
+            fileRenamePathInside(New, *Canonical))))
+        return error("file rename changes compiler path namespace {0} from "
+                     "option {1}",
+                     Absolute, Option);
     auto S = FS->status(Absolute);
     if (S) {
       if (llvm::any_of(ExpandedRenames, [&](const auto &Rename) {
@@ -211,6 +374,12 @@ llvm::Error validateCompileCommandForRenames(
     return llvm::Error::success();
   };
 
+  auto CheckPath = [&](llvm::StringRef Value, llvm::StringRef Option,
+                       bool IncludesDescendants = false) -> llvm::Error {
+    return CheckPathFrom(Value, Normalized->EffectiveDirectory, Option,
+                         IncludesDescendants);
+  };
+
   auto CheckHeaderSpelling = [&](llvm::StringRef Value,
                                  llvm::StringRef Option) -> llvm::Error {
     if (Value.empty())
@@ -219,42 +388,66 @@ llvm::Error validateCompileCommandForRenames(
         llvm::sys::path::has_parent_path(Value))
       return CheckPath(Value, Option);
     for (const auto &Rename : Renames)
-      if (llvm::sys::path::filename(Rename.first) == Value)
-        return error("file rename moves compiler header {0} named by option "
-                     "{1}",
-                     Rename.first, Option);
+      if (llvm::sys::path::filename(Rename.first) == Value ||
+          llvm::sys::path::filename(Rename.second) == Value)
+        return error("file rename may change compiler header {0} named by "
+                     "option {1}",
+                     Value, Option);
     return llvm::Error::success();
   };
 
   if (auto Err = CheckPath(Command.Directory, "compilation working directory"))
     return Err;
-  if (Command.CommandLine.empty())
-    return error("compiler command line is empty");
-  if (Command.HadResponseFile)
-    return error("cannot prove compiler response-file expansion after rename");
-  if (Command.HadConfigFile)
-    return error("cannot prove compiler configuration-file expansion after "
-                 "rename");
-
-  auto Normalized = normalizeCompilerCommand(Command);
-  if (!Normalized)
-    return Normalized.takeError();
+  if (Normalized->WorkingDirectory)
+    if (auto Err = CheckPath(Normalized->EffectiveDirectory,
+                             "compiler working directory"))
+      return Err;
 
   if (Normalized->Mode != CompilerInvocationMode::DirectCC1) {
     if (compilerLoadsConfigFile(Command))
       return error("compiler driver currently loads a configuration file");
+    auto JobCount = compilerDriverJobCount(Command);
+    if (!JobCount)
+      return JobCount.takeError();
+    if (*JobCount != 1)
+      return error("cannot prove all {0} compiler jobs selected by command",
+                   *JobCount);
   }
 
   llvm::StringRef Executable = Command.CommandLine.front();
-  if (llvm::sys::path::is_absolute(Executable) ||
-      llvm::sys::path::has_parent_path(Executable)) {
-    if (auto Err = CheckPath(Executable, "compiler executable"))
-      return Err;
-  } else {
+  std::string ResolvedExecutable;
+  if (!llvm::sys::path::is_absolute(Executable) &&
+      !llvm::sys::path::has_parent_path(Executable)) {
+    auto Found = llvm::sys::findProgramByName(Executable);
+    if (!Found)
+      return error("cannot resolve compiler executable {0}: {1}", Executable,
+                   Found.getError().message());
+    ResolvedExecutable = std::move(*Found);
+    Executable = ResolvedExecutable;
     for (const auto &Rename : Renames)
-      if (llvm::sys::path::filename(Rename.first) == Executable)
-        return error("file rename moves compiler executable {0}", Rename.first);
+      if (llvm::sys::path::filename(Rename.second) ==
+          llvm::sys::path::filename(Command.CommandLine.front()))
+        return error("file rename may change compiler executable resolution at "
+                     "{0}",
+                     Rename.second);
   }
+  if (!isClangDriverName(Command.CommandLine.front())) {
+    if (!isAmbiguousDriverName(Command.CommandLine.front()))
+      return error("file rename requires a Clang compiler, not {0}",
+                   Command.CommandLine.front());
+    llvm::SmallString<256> RealExecutable;
+    if (std::error_code EC = llvm::sys::fs::real_path(Executable,
+                                                       RealExecutable))
+      return error("cannot identify compiler executable {0}: {1}", Executable,
+                   EC.message());
+    if (!isClangDriverName(RealExecutable))
+      return error("file rename requires a Clang compiler, but {0} resolves "
+                   "to {1}",
+                   Command.CommandLine.front(), RealExecutable);
+  }
+  if (auto Err = CheckPathFrom(Executable, Command.Directory,
+                               "compiler executable"))
+    return Err;
 
   for (llvm::StringRef Arg : llvm::ArrayRef(Command.CommandLine).drop_front())
     if (Arg.starts_with("@"))
@@ -269,6 +462,13 @@ llvm::Error validateCompileCommandForRenames(
                       unsigned Depth) -> llvm::Error {
     if (Depth > 8)
       return error("compiler option forwarding is nested too deeply");
+    for (llvm::StringRef Arg : Args)
+      if (Arg.contains("__has_include") ||
+          Arg.contains("__has_include_next") ||
+          Arg.contains("__has_embed"))
+        return error("cannot prove preprocessor file query from compiler "
+                     "argument {0}",
+                     Arg);
     llvm::SmallVector<const char *> RawArgs;
     RawArgs.reserve(Args.size());
     for (llvm::StringRef Arg : Args)
@@ -313,9 +513,33 @@ llvm::Error validateCompileCommandForRenames(
       }
 
       const unsigned ID = Arg->getOption().getUnaliasedOption().getID();
+      if (isPluginOption(ID))
+        return error("cannot prove file dependencies of compiler plugin option "
+                     "{0}",
+                     Arg->getSpelling());
+      if (isPrecompiledInputOption(ID))
+        return error("cannot prove transitive dependencies of precompiled "
+                     "compiler input {0}",
+                     Arg->getSpelling());
+      if (isOpaqueForwardingOption(ID) ||
+          Arg->getOption().hasFlag(options::LinkerInput))
+        return error("cannot prove file dependencies of opaque compiler option "
+                     "{0}",
+                     Arg->getSpelling());
       PathSemantics Semantics = pathSemantics(ID);
       if (Semantics == PathSemantics::None)
         continue;
+      if (Semantics == PathSemantics::PathList) {
+        for (llvm::StringRef Path : Arg->getValues())
+          if (auto Err = CheckPath(Path, Arg->getSpelling()))
+            return Err;
+        continue;
+      }
+      if (Semantics == PathSemantics::ImplicitProfile) {
+        if (auto Err = CheckPath("default.profdata", Arg->getSpelling()))
+          return Err;
+        continue;
+      }
       if (Arg->getNumValues() != 1)
         return error("compiler option {0} does not have exactly one path",
                      Arg->getSpelling());
@@ -363,12 +587,6 @@ llvm::Error validateCompileCommandForRenames(
           return Err;
         break;
       }
-      case PathSemantics::ModuleFile:
-        if (size_t Equals = Value.rfind('='); Equals != llvm::StringRef::npos)
-          Value = Value.drop_front(Equals + 1);
-        if (auto Err = CheckPath(Value, Arg->getSpelling()))
-          return Err;
-        break;
       case PathSemantics::RemapPair: {
         auto Pair = Value.split(';');
         if (Pair.first.empty() || Pair.second.empty() ||
@@ -418,6 +636,9 @@ llvm::Error validateCompileCommandForRenames(
         if (auto Err = CheckHeaderSpelling(Value, Arg->getSpelling()))
           return Err;
         break;
+      case PathSemantics::PathList:
+      case PathSemantics::ImplicitProfile:
+        llvm_unreachable("handled above");
       }
     }
     if (!ForwardedDriver.empty())

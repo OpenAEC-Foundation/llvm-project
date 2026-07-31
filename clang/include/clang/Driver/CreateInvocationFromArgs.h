@@ -49,6 +49,8 @@ struct CreateInvocationOptions {
   std::vector<std::string> *CC1Args = nullptr;
   /// If set, records whether the driver loaded any configuration file.
   bool *HadConfigFile = nullptr;
+  /// If set, records the number of jobs produced by the driver.
+  unsigned *DriverJobCount = nullptr;
 };
 
 /// Interpret clang arguments in preparation to parse a file.

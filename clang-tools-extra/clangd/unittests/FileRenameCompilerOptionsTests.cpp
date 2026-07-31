@@ -9,7 +9,14 @@
 #include "CompilerInvocation.h"
 #include "FileRename.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/Testing/Support/Error.h"
 #include "gmock/gmock.h"
@@ -40,10 +47,54 @@ llvm::Error validate(llvm::ArrayRef<std::string> Args,
   Command.Directory = "/workspace";
   Command.Filename = "/workspace/main.cpp";
   Command.CommandLine.assign(Args.begin(), Args.end());
+  if (Command.CommandLine.size() > 1 && Command.CommandLine[1] == "-cc1")
+    Command.CommandLine.insert(Command.CommandLine.begin() + 2,
+                               "-fsyntax-only");
+  else if (!Command.CommandLine.empty() &&
+           llvm::StringRef(Command.CommandLine.front()).contains("clang-cl"))
+    Command.CommandLine.insert(Command.CommandLine.begin() + 1, "/c");
+  else if (!Command.CommandLine.empty())
+    Command.CommandLine.insert(Command.CommandLine.begin() + 1, "-c");
   if (!llvm::is_contained(Command.CommandLine, "main.cpp"))
     Command.CommandLine.push_back("main.cpp");
   return validateCompileCommandForRenames(Command, Renames, {}, nullptr,
                                           DerivedCC1);
+}
+
+TEST(FileRenameCompilerOptions, RejectsNonClangAndLinkCommands) {
+  EXPECT_THAT_ERROR(
+      validate({"gcc", "main.cpp"}),
+      llvm::FailedWithMessage(HasSubstr("requires a Clang compiler")));
+
+  auto Link = command({"clang", "main.cpp"});
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(
+          Link, {{"/workspace/config", "/workspace/moved"}}, {}, nullptr, {}),
+      llvm::FailedWithMessage(HasSubstr("compile-only")));
+}
+
+TEST(FileRenameCompilerOptions, RejectsCommandsWithMultipleFrontendJobs) {
+  auto Command = command({"clang", "--target=x86_64-apple-darwin", "-arch",
+                          "x86_64", "-arch", "arm64", "-c", "main.cpp"});
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(Command, {}, {}, nullptr, {}),
+      llvm::FailedWithMessage(HasSubstr("compiler jobs")));
+}
+
+TEST(FileRenameCompilerOptions, RejectsDependencyContainersAndFileQueries) {
+  for (const std::vector<std::string> &Args : {
+           std::vector<std::string>{"clang", "-ivfsoverlay",
+                                    "/workspace/overlay.yaml"},
+           std::vector<std::string>{"clang",
+                                    "-fmodule-map-file=/workspace/map.txt"},
+           std::vector<std::string>{"clang",
+                                    "-DHAS=__has_include(\"old.h\")"},
+           std::vector<std::string>{"clang", "-fuse-ld=custom-ld"},
+           std::vector<std::string>{"clang", "--ld-path=/workspace/ld"},
+       }) {
+    SCOPED_TRACE(llvm::join(Args, " "));
+    EXPECT_THAT_ERROR(validate(Args), llvm::Failed());
+  }
 }
 
 TEST(FileRenameCompilerOptions, RejectsDriverGeneratedSearchRoots) {
@@ -92,15 +143,197 @@ TEST(FileRenameCompilerOptions, RejectsSemanticDriverFiles) {
                "clang", "--warning-suppression-mappings=/workspace/config"},
            std::vector<std::string>{"clang",
                                     "--multi-lib-config=/workspace/config"},
-           std::vector<std::string>{"clang", "-fplugin=/workspace/config"},
-           std::vector<std::string>{"clang", "-fpass-plugin=/workspace/config"},
-           std::vector<std::string>{"clang",
-                                    "--hipspv-pass-plugin=/workspace/config"},
        }) {
     SCOPED_TRACE(llvm::join(Args, " "));
     EXPECT_THAT_ERROR(validate(Args),
                       llvm::FailedWithMessage(HasSubstr("compiler")));
   }
+}
+
+TEST(FileRenameCompilerOptions, RejectsUnprovenPlugins) {
+  for (const std::vector<std::string> &Args : {
+           std::vector<std::string>{"clang", "-fplugin=/workspace/plugin.so"},
+           std::vector<std::string>{"clang",
+                                    "-fpass-plugin=/workspace/plugin.so"},
+           std::vector<std::string>{"clang",
+                                    "--hipspv-pass-plugin=/workspace/plugin.so"},
+           std::vector<std::string>{"clang", "-Xclang", "-load", "-Xclang",
+                                    "/workspace/plugin.so"},
+           std::vector<std::string>{"clang", "-Xclang", "-add-plugin",
+                                    "-Xclang", "custom"},
+       }) {
+    SCOPED_TRACE(llvm::join(Args, " "));
+    EXPECT_THAT_ERROR(
+        validate(Args),
+        llvm::FailedWithMessage(HasSubstr("compiler plugin option")));
+  }
+}
+
+TEST(FileRenameCompilerOptions, RejectsPrecompiledInputs) {
+  for (const std::vector<std::string> &Args : {
+           std::vector<std::string>{"clang", "-include-pch",
+                                    "/workspace/prefix.pch"},
+           std::vector<std::string>{"clang",
+                                    "-fmodule-file=Foo=/workspace/foo.pcm"},
+           std::vector<std::string>{"clang",
+                                    "-fprebuilt-module-path=/workspace/modules"},
+           std::vector<std::string>{"clang", "-Xclang", "-ast-merge",
+                                    "-Xclang", "/workspace/merge.ast"},
+       }) {
+    SCOPED_TRACE(llvm::join(Args, " "));
+    EXPECT_THAT_ERROR(
+        validate(Args),
+        llvm::FailedWithMessage(HasSubstr("precompiled compiler input")));
+  }
+}
+
+TEST(FileRenameCompilerOptions, RejectsOpaqueDownstreamOptions) {
+  for (const std::vector<std::string> &Args : {
+           std::vector<std::string>{"clang", "-mllvm", "-config=old.cfg"},
+           std::vector<std::string>{"clang", "-Xassembler", "old.cfg"},
+           std::vector<std::string>{"clang", "-Wa,@old.rsp"},
+           std::vector<std::string>{"clang", "-Xlinker", "old.ld"},
+           std::vector<std::string>{"clang", "-Wl,-T,/workspace/old.ld"},
+           std::vector<std::string>{"clang", "-Xcuda-ptxas", "old.cfg"},
+       }) {
+    SCOPED_TRACE(llvm::join(Args, " "));
+    EXPECT_THAT_ERROR(
+        validate(Args),
+        llvm::FailedWithMessage(HasSubstr("opaque compiler option")));
+  }
+}
+
+TEST(FileRenameCompilerOptions, RejectsAllExplicitSemanticInputFiles) {
+  for (const std::vector<std::string> &Args : {
+           std::vector<std::string>{"clang",
+                                    "-fembed-offload-object=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fprofile-sample-use=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fprofile-instr-use=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fprofile-remapping-file=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fprofile-list=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fcodegen-data-use=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fmemory-profile-use=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fsanitize-ignorelist=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "-fsanitize-system-ignorelist=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "-fsanitize-coverage-allowlist=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "-fsanitize-coverage-ignorelist=/workspace/config"},
+           std::vector<std::string>{
+               "clang",
+               "-fexperimental-sanitize-metadata-ignorelist=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "-frandomize-layout-seed-file=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fxray-always-instrument=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fxray-never-instrument=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fxray-attr-list=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "-fms-secure-hotpatch-functions-file=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fthinlto-index=/workspace/config"},
+           std::vector<std::string>{
+               "clang", "--extract-api-ignores=/other,/workspace/config"},
+       }) {
+    SCOPED_TRACE(llvm::join(Args, " "));
+    EXPECT_THAT_ERROR(validate(Args),
+                      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+
+  for (const std::vector<std::string> &CC1Args : {
+           std::vector<std::string>{"-cc1", "-mlink-builtin-bitcode",
+                                    "/workspace/config"},
+           std::vector<std::string>{"-cc1", "-mlink-bitcode-file",
+                                    "/workspace/config"},
+           std::vector<std::string>{
+               "-cc1", "-fprofile-instrument-use-path=/workspace/config"},
+           std::vector<std::string>{"-cc1", "-fcuda-include-gpubinary",
+                                    "/workspace/config"},
+           std::vector<std::string>{"-cc1", "-fopenmp-host-ir-file-path",
+                                    "/workspace/config"},
+       }) {
+    SCOPED_TRACE(llvm::join(CC1Args, " "));
+    EXPECT_THAT_ERROR(
+        validate({"clang", "main.cpp"},
+                 {{"/workspace/config", "/workspace/moved"}}, CC1Args),
+        llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+}
+
+TEST(FileRenameCompilerOptions, RejectsImplicitAndDirectoryProfileInputs) {
+  EXPECT_THAT_ERROR(
+      validate({"clang", "-fprofile-instr-use"},
+               {{"/workspace/default.profdata", "/workspace/moved"}}),
+      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  EXPECT_THAT_ERROR(
+      validate({"clang", "-fprofile-use=/workspace/profiles"},
+               {{"/workspace/profiles/default.profdata", "/workspace/moved"}}),
+      llvm::FailedWithMessage(HasSubstr("compiler path")));
+}
+
+TEST(FileRenameCompilerOptions, ResolvesBareCompilerExecutable) {
+  auto Compiler = llvm::sys::findProgramByName("clang");
+  ASSERT_TRUE(Compiler) << Compiler.getError().message();
+  EXPECT_THAT_ERROR(
+      validate({"clang", "main.cpp"},
+               {{*Compiler, "/workspace/replacement-clang"}}),
+      llvm::FailedWithMessage(HasSubstr("compiler executable")));
+  EXPECT_THAT_ERROR(
+      validate({"aarch64-unknown-linux-gnu-clang", "main.cpp"}),
+      llvm::FailedWithMessage(HasSubstr("cannot resolve compiler executable")));
+  EXPECT_THAT_ERROR(
+      validate({"clang", "main.cpp"},
+               {{"/workspace/old", "/workspace/clang"}}),
+      llvm::FailedWithMessage(HasSubstr("executable resolution")));
+}
+
+TEST(FileRenameCompilerOptions, CanonicalizesBothSidesOfTreeRoots) {
+  llvm::SmallString<256> Workspace;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory(
+      "clangd-rename-tree-root", Workspace));
+  llvm::scope_exit Cleanup(
+      [&] { llvm::sys::fs::remove_directories(Workspace); });
+  auto Path = [&](llvm::StringRef Name) {
+    llvm::SmallString<256> Result(Workspace);
+    llvm::sys::path::append(Result, Name);
+    return Result.str().str();
+  };
+  const std::string Root = Path("toolchain");
+  const std::string Alias = Path("toolchain-alias");
+  ASSERT_FALSE(llvm::sys::fs::create_directory(Root));
+  ASSERT_FALSE(llvm::sys::fs::create_link(Root, Alias));
+
+  const std::string OldInside = Path("toolchain/old.cfg");
+  const std::string Outside = Path("outside.cfg");
+  for (PathRef File : {PathRef(OldInside), PathRef(Outside)}) {
+    int FD;
+    ASSERT_FALSE(llvm::sys::fs::openFileForWrite(File, FD));
+    llvm::raw_fd_ostream Stream(FD, /*shouldClose=*/true);
+  }
+
+  tooling::CompileCommand Command;
+  Command.Directory = Workspace.str().str();
+  Command.Filename = Path("main.cpp");
+  Command.CommandLine = {"clang", "-c", "-B", Alias, Command.Filename};
+  auto FS = llvm::vfs::getRealFileSystem();
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(
+          Command, {{OldInside, Path("moved.cfg")}}, {}, FS.get(), {}),
+      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(
+          Command, {{Outside, Path("toolchain/new.cfg")}}, {}, FS.get(), {}),
+      llvm::FailedWithMessage(HasSubstr("compiler path namespace")));
 }
 
 TEST(FileRenameCompilerOptions, ParsesClangCLMode) {
@@ -128,8 +361,6 @@ TEST(FileRenameCompilerOptions, ParsesForwardedAndDirectCC1Options) {
            std::vector<std::string>{"clang", "-Xpreprocessor",
                                     "-I/workspace/config"},
            std::vector<std::string>{"clang", "-Wp,-I,/workspace/config"},
-           std::vector<std::string>{"clang", "-cc1", "-ast-merge",
-                                    "/workspace/config/state.ast"},
            std::vector<std::string>{"clang", "-cc1", "-remap-file",
                                     "/workspace/config/from;/workspace/other"},
            std::vector<std::string>{"clang", "-cc1", "-remap-file",
@@ -137,8 +368,6 @@ TEST(FileRenameCompilerOptions, ParsesForwardedAndDirectCC1Options) {
            std::vector<std::string>{
                "clang", "-cc1",
                "-foverride-record-layout=/workspace/config/layout.txt"},
-           std::vector<std::string>{"clang", "-cc1", "-load",
-                                    "/workspace/config/plugin.so"},
        }) {
     SCOPED_TRACE(llvm::join(Args, " "));
     EXPECT_THAT_ERROR(validate(Args),
@@ -283,10 +512,28 @@ TEST(FileRenameCompilerOptions, RecordsLastEffectiveWorkingDirectory) {
                "-working-directory=/workspace/last", "../main.cpp"}));
   ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
   EXPECT_EQ(Result->EffectiveDirectory, "/workspace/last");
-  ASSERT_EQ(Result->WorkingDirectories.size(), 2u);
-  EXPECT_EQ(Result->WorkingDirectories.back().ArgumentIndex, 3u);
-  EXPECT_EQ(Result->WorkingDirectories.back().ValueOffset,
+  ASSERT_TRUE(Result->WorkingDirectory);
+  EXPECT_EQ(Result->WorkingDirectory->ArgumentIndex, 3u);
+  EXPECT_EQ(Result->WorkingDirectory->ValueOffset,
             llvm::StringRef("-working-directory=").size());
+}
+
+TEST(FileRenameCompilerOptions, ResolvesPathsFromLastWorkingDirectory) {
+  auto Command = command({"clang", "-working-directory", "/workspace/first",
+                          "-working-directory=/workspace/project", "-Iinclude",
+                          "-c", "main.cpp"});
+  Command.Directory = "/workspace/build";
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(
+          Command,
+          {{"/workspace/project/include", "/workspace/project/moved"}}, {},
+          nullptr, {}),
+      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(
+          Command, {{"/workspace/build/include", "/workspace/build/moved"}},
+          {}, nullptr, {}),
+      llvm::Succeeded());
 }
 
 TEST(FileRenameCompilerOptions, CompileCommandEqualityIncludesProvenance) {

@@ -667,7 +667,10 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
           ? llvm::json::Object{{"prepareProvider", true}}
           : llvm::json::Value(true);
 
-  if ((Params.capabilities.WillRenameFiles && SupportsDocumentChanges) ||
+  const bool CanPrepareFileRenames =
+      Opts.BackgroundIndex && Opts.WorkspaceRoot.has_value();
+  if ((Params.capabilities.WillRenameFiles && SupportsDocumentChanges &&
+       CanPrepareFileRenames) ||
       Params.capabilities.DidRenameFiles) {
     llvm::json::Object FileOperations;
     auto Registration = [] {
@@ -678,7 +681,8 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
                       }}},
       };
     };
-    if (Params.capabilities.WillRenameFiles && SupportsDocumentChanges)
+    if (Params.capabilities.WillRenameFiles && SupportsDocumentChanges &&
+        CanPrepareFileRenames)
       FileOperations["willRename"] = Registration();
     if (Params.capabilities.DidRenameFiles)
       FileOperations["didRename"] = Registration();

@@ -149,7 +149,6 @@ public:
     FileDigest Digest{{0}};
     IncludeGraphNode::SourceFlag Flags{};
     std::vector<Path> DirectIncludes;
-    bool HasConditionalIncludes = false;
   };
 
   struct IncludeGraphSnapshot {

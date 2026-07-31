@@ -85,12 +85,18 @@ TEST_F(BackgroundIndexTest, IncludeGraphPreservesTranslationUnitContexts) {
 TEST_F(BackgroundIndexTest, IncludeGraphMarksConditionalIncludes) {
   MockFS FS;
   const Path Main = testPath("root/main.cpp");
+  const Path Header = testPath("root/conditional.h");
   FS.Files[Main] = R"cpp(
+#include "conditional.h"
 #if ENABLE_HEADER
 #include "conditional.h"
 #endif
 )cpp";
-  FS.Files[testPath("root/conditional.h")] = "";
+  FS.Files[Header] = R"cpp(
+#if ENABLE_OTHER
+#include OTHER_HEADER
+#endif
+)cpp";
 
   llvm::StringMap<std::string> Storage;
   size_t CacheHits = 0;
@@ -111,8 +117,20 @@ TEST_F(BackgroundIndexTest, IncludeGraphMarksConditionalIncludes) {
       Graph->Files,
       Contains(testing::AllOf(
           testing::Field(&BackgroundIndex::IndexedFile::File, Main),
-          testing::Field(&BackgroundIndex::IndexedFile::HasConditionalIncludes,
-                         true))));
+          testing::Field(
+              &BackgroundIndex::IndexedFile::Flags,
+              testing::Truly([](IncludeGraphNode::SourceFlag Flags) {
+                return Flags & IncludeGraphNode::SourceFlag::HasConditionalIncludes;
+              })))));
+  EXPECT_THAT(
+      Graph->Files,
+      Contains(testing::AllOf(
+          testing::Field(&BackgroundIndex::IndexedFile::File, Header),
+          testing::Field(
+              &BackgroundIndex::IndexedFile::Flags,
+              testing::Truly([](IncludeGraphNode::SourceFlag Flags) {
+                return Flags & IncludeGraphNode::SourceFlag::HasConditionalIncludes;
+              })))));
 }
 
 TEST_F(BackgroundIndexTest, IncludeGraphRejectsMissingTranslationUnit) {
@@ -282,8 +300,11 @@ TEST_F(BackgroundIndexTest,
       Graph->Files,
       Contains(testing::AllOf(
           testing::Field(&BackgroundIndex::IndexedFile::File, Main),
-          testing::Field(&BackgroundIndex::IndexedFile::HasConditionalIncludes,
-                         true))));
+          testing::Field(
+              &BackgroundIndex::IndexedFile::Flags,
+              testing::Truly([](IncludeGraphNode::SourceFlag Flags) {
+                return Flags & IncludeGraphNode::SourceFlag::HasConditionalIncludes;
+              })))));
 }
 
 TEST_F(BackgroundIndexTest, RebuildsMissingOrMalformedCachedContextGraph) {

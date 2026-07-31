@@ -81,6 +81,14 @@ public:
 
   virtual void discardPreparedFileRenames() const {}
 
+  /// Returns the command that would be used for File if the currently
+  /// prepared rename were committed. Callers must establish the destination
+  /// file's Context before calling this.
+  virtual std::optional<tooling::CompileCommand>
+  getCompileCommandAfterPreparedFileRenames(PathRef File) const {
+    return getCompileCommand(File);
+  }
+
   virtual llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
     return llvm::Error::success();
@@ -125,6 +133,9 @@ public:
                                      ValidatedCommands) const override;
 
   void discardPreparedFileRenames() const override;
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommandAfterPreparedFileRenames(PathRef File) const override;
 
   llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const override;
@@ -264,6 +275,9 @@ public:
                                      ValidatedCommands) const override;
 
   void discardPreparedFileRenames() const override;
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommandAfterPreparedFileRenames(PathRef File) const override;
 
   llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const override;

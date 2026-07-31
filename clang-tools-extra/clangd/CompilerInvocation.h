@@ -12,6 +12,7 @@
 #include "support/Path.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/Support/Error.h"
+#include <optional>
 #include <vector>
 
 namespace clang {
@@ -30,7 +31,7 @@ struct NormalizedCompilerCommand {
   CompilerInvocationMode Mode = CompilerInvocationMode::GCCDriver;
   Path EffectiveDirectory;
   std::vector<CompilerInputArgument> Inputs;
-  std::vector<CompilerInputArgument> WorkingDirectories;
+  std::optional<CompilerInputArgument> WorkingDirectory;
 };
 
 llvm::Expected<NormalizedCompilerCommand>
@@ -41,6 +42,10 @@ compilerInvocationMode(llvm::ArrayRef<std::string> CommandLine);
 
 /// Whether building this driver command now loads a configuration file.
 bool compilerLoadsConfigFile(const tooling::CompileCommand &Command);
+
+/// Number of compiler jobs selected by the driver for this command.
+llvm::Expected<unsigned>
+compilerDriverJobCount(const tooling::CompileCommand &Command);
 
 } // namespace clangd
 } // namespace clang

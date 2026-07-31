@@ -6,11 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "FileRename.h"
 #include "FileRenameInternal.h"
 #include "TestFS.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Testing/Support/Error.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <memory>
 #include <mutex>
@@ -91,6 +94,71 @@ TEST(FileRenameDirectiveCache, FailedFrozenDigestCheckDoesNotCommit) {
   ASSERT_THAT_EXPECTED(Cache.scan(File, digest(TFS.Files.lookup(File))),
                        llvm::Succeeded());
   EXPECT_EQ(TFS.reads(File), 2U);
+}
+
+TEST(FileRenameDirectiveCache, TreatsIncludeGuardsAsConditional) {
+  MockFS TFS;
+  const Path File = testPath("guarded.h");
+  TFS.Files[File] = R"cpp(
+#ifndef GUARDED_H
+#define GUARDED_H
+#include "target.h"
+#endif
+)cpp";
+  auto FS = TFS.view(std::nullopt);
+  auto Scan = scanFileRenameDirectives(File, *FS);
+  ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
+  ASSERT_EQ(Scan->ConditionalIncludes.size(), 1U);
+  EXPECT_EQ(Scan->ConditionalIncludes.front().Written, "\"target.h\"");
+}
+
+TEST(FileRenameDirectiveCache, FindsUneditableDependencyForms) {
+  MockFS TFS;
+  const Path Source = testPath("dependencies.cpp");
+  TFS.Files[Source] = R"cpp(
+#define HAS_HEADER __has_include("optional.h")
+#if HAS_HEADER
+#endif
+#embed <blob.bin>
+import "unit.h";
+#pragma GCC dependency "stamp"
+_Pragma("clang dependency \"other-stamp\"")
+asm(".incbin \"payload.bin\"");
+)cpp";
+  auto FS = TFS.view(std::nullopt);
+  auto Scan = scanFileRenameDirectives(Source, *FS);
+  ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
+  for (llvm::StringRef Kind :
+       {"__has_include", "#embed directive", "C++ header-unit import",
+        "dependency pragma", "_Pragma dependency",
+        "unproven inline assembly dependency"})
+    EXPECT_TRUE(llvm::any_of(Scan->UneditableDependencies,
+                             [&](const UneditableFileDependency &Dependency) {
+                               return Dependency.Kind == Kind;
+                             }))
+        << Kind.str();
+}
+
+TEST(FileRenameDirectiveCache, FindsModuleMapDependencies) {
+  MockFS TFS;
+  const Path ModuleMap = testPath("custom.modulemap");
+  TFS.Files[ModuleMap] = R"modulemap(
+module Example {
+  header "header.h"
+  umbrella "include"
+  extern module Other "other.modulemap"
+}
+)modulemap";
+  auto FS = TFS.view(std::nullopt);
+  auto Scan = scanFileRenameDirectives(ModuleMap, *FS);
+  ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
+  EXPECT_THAT(
+      Scan->UneditableDependencies,
+      testing::Contains(testing::AllOf(
+          testing::Field(&UneditableFileDependency::Kind,
+                         "module-map dependency"),
+          testing::Field(&UneditableFileDependency::Written,
+                         "\"other.modulemap\""))));
 }
 
 } // namespace

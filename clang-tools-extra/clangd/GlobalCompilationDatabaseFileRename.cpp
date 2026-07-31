@@ -125,6 +125,14 @@ OverlayCDB::buildRenamePlanLocked(
   auto Plan = std::make_unique<PreparedRename>();
   Plan->Renames.assign(Renames.begin(), Renames.end());
   Plan->Generation = CommandGeneration;
+  llvm::StringMap<Path> PlannedOrigins;
+  llvm::StringSet<> CollidingDestinations;
+
+  auto Invalidate = [&](PathRef OldKey, PathRef NewKey) {
+    Plan->ChangedFiles.push_back(OldKey.str());
+    if (OldKey != NewKey)
+      Plan->ChangedFiles.push_back(NewKey.str());
+  };
 
   auto Rewrite = [&](tooling::CompileCommand &Command,
                      const CompilerInputArgument &Span, PathRef NewBase,
@@ -149,37 +157,47 @@ OverlayCDB::buildRenamePlanLocked(
     auto NewKey = mapPathAfterRenames(Entry.first(), Renames);
     if (!NewKey)
       return NewKey.takeError();
-    if (!ValidatedCommands) {
-      Plan->ChangedFiles.push_back(Entry.first().str());
-      if (Entry.first() != *NewKey)
-        Plan->ChangedFiles.push_back(*NewKey);
-      continue;
-    }
-    auto Expected = ValidatedCommands->find(Entry.first());
-    if (Expected == ValidatedCommands->end()) {
-      Plan->ChangedFiles.push_back(Entry.first().str());
-      if (Entry.first() != *NewKey)
-        Plan->ChangedFiles.push_back(*NewKey);
-      continue;
-    }
     tooling::CompileCommand Command = Entry.getValue();
     const tooling::CompileCommand OriginalCommand = Command;
-    auto EffectiveCommand = Command;
-    expandResponseFileProvenance(EffectiveCommand);
-    if (Mangler)
-      Mangler(EffectiveCommand, Entry.first());
-    EffectiveCommand.HadConfigFile |= compilerLoadsConfigFile(EffectiveCommand);
-    if (!commandMatchesFileRenameSnapshot(EffectiveCommand,
-                                          Expected->getValue()))
-      return error("compilation command changed while preparing file rename: "
-                   "{0}",
-                   Entry.first());
+    tooling::CompileCommand RawCommand = Command;
+    expandResponseFileProvenance(RawCommand);
+    RawCommand.HadConfigFile |= compilerLoadsConfigFile(RawCommand);
+    if (ValidatedCommands) {
+      auto Expected = ValidatedCommands->find(Entry.first());
+      if (Expected != ValidatedCommands->end()) {
+        auto EffectiveCommand = Command;
+        expandResponseFileProvenance(EffectiveCommand);
+        if (Mangler)
+          Mangler(EffectiveCommand, Entry.first());
+        EffectiveCommand.HadConfigFile |=
+            compilerLoadsConfigFile(EffectiveCommand);
+        if (!commandMatchesFileRenameSnapshot(EffectiveCommand,
+                                              Expected->getValue()))
+          return error(
+              "compilation command changed while preparing file rename: {0}",
+              Entry.first());
+      }
+    }
+    // First prove that the original command is classifiable in isolation.
+    // Paths that move with the command (notably its working directory and
+    // source operands) are rewritten below, so validating them against the
+    // rename before rewriting would reject migrations we can preserve.
+    if (auto Err = validateCompileCommandForRenames(RawCommand, {}, {},
+                                                    nullptr, {})) {
+      vlog("Invalidating unprovable overlay command {0} during file rename: "
+           "{1}",
+           Entry.first(), llvm::toString(std::move(Err)));
+      Invalidate(Entry.first(), *NewKey);
+      continue;
+    }
     auto Normalized = normalizeCompilerCommand(Command);
-    if (!Normalized)
-      return joinErrors(
-          error("cannot prepare overlay compile command {0} for file rename",
-                Entry.first()),
-          Normalized.takeError());
+    if (!Normalized) {
+      vlog("Invalidating unclassifiable overlay command {0} during file "
+           "rename: {1}",
+           Entry.first(), llvm::toString(Normalized.takeError()));
+      Invalidate(Entry.first(), *NewKey);
+      continue;
+    }
     auto NewDirectory = mapPathAfterRenames(Command.Directory, Renames);
     if (!NewDirectory)
       return NewDirectory.takeError();
@@ -193,11 +211,13 @@ OverlayCDB::buildRenamePlanLocked(
         return Mapped.takeError();
       Rewrite(Command, Input, *NewEffective, *Mapped);
     }
-    for (const CompilerInputArgument &WD : Normalized->WorkingDirectories) {
-      auto Mapped = mapPathAfterRenames(WD.AbsolutePath, Renames);
+    if (Normalized->WorkingDirectory) {
+      auto Mapped =
+          mapPathAfterRenames(Normalized->WorkingDirectory->AbsolutePath,
+                              Renames);
       if (!Mapped)
         return Mapped.takeError();
-      Rewrite(Command, WD, *NewDirectory, *Mapped);
+      Rewrite(Command, *Normalized->WorkingDirectory, *NewDirectory, *Mapped);
     }
     if (!Command.Filename.empty()) {
       llvm::SmallString<256> Filename(Command.Filename);
@@ -213,21 +233,42 @@ OverlayCDB::buildRenamePlanLocked(
         Command.Filename = *Mapped;
     }
     Command.Directory = *NewDirectory;
+    tooling::CompileCommand PlannedRaw = Command;
+    expandResponseFileProvenance(PlannedRaw);
+    PlannedRaw.HadConfigFile |= compilerLoadsConfigFile(PlannedRaw);
+    if (auto Err = validateCompileCommandForRenames(PlannedRaw, Renames, {},
+                                                    nullptr, {})) {
+      vlog("Invalidating unprovable renamed overlay command {0}: {1}",
+           Entry.first(), llvm::toString(std::move(Err)));
+      Invalidate(Entry.first(), *NewKey);
+      continue;
+    }
     tooling::CompileCommand PlannedEffective = Command;
     expandResponseFileProvenance(PlannedEffective);
     if (Mangler)
       Mangler(PlannedEffective, *NewKey);
     PlannedEffective.HadConfigFile |= compilerLoadsConfigFile(PlannedEffective);
     if (auto Err = validateCompileCommandForRenames(PlannedEffective, Renames,
-                                                    {}, nullptr, {}))
-      return joinErrors(
-          error("cannot prepare overlay compile command {0} for file rename",
-                Entry.first()),
-          std::move(Err));
+                                                    {}, nullptr, {})) {
+      vlog("Invalidating unprovable effective overlay command {0}: {1}",
+           Entry.first(), llvm::toString(std::move(Err)));
+      Invalidate(Entry.first(), *NewKey);
+      continue;
+    }
     const bool CommandChanged = Command != OriginalCommand;
-    if (!Plan->Commands.try_emplace(*NewKey, std::move(Command)).second)
-      return error("file rename collides at compilation command path {0}",
-                   *NewKey);
+    if (CollidingDestinations.contains(*NewKey)) {
+      Invalidate(Entry.first(), *NewKey);
+      continue;
+    }
+    if (!Plan->Commands.try_emplace(*NewKey, std::move(Command)).second) {
+      Invalidate(Entry.first(), *NewKey);
+      Invalidate(PlannedOrigins.lookup(*NewKey), *NewKey);
+      Plan->Commands.erase(*NewKey);
+      PlannedOrigins.erase(*NewKey);
+      CollidingDestinations.insert(*NewKey);
+      continue;
+    }
+    PlannedOrigins[*NewKey] = Entry.first().str();
     if (Entry.first() != *NewKey || CommandChanged) {
       Plan->ChangedFiles.push_back(Entry.first().str());
       if (Entry.first() != *NewKey)
@@ -302,6 +343,26 @@ void OverlayCDB::discardPreparedFileRenames() const {
   DelegatingCDB::discardPreparedFileRenames();
 }
 
+std::optional<tooling::CompileCommand>
+OverlayCDB::getCompileCommandAfterPreparedFileRenames(PathRef File) const {
+  std::optional<tooling::CompileCommand> Command;
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (Prepared) {
+      auto It = Prepared->Commands.find(removeDots(File));
+      if (It != Prepared->Commands.end())
+        Command = It->second;
+    }
+  }
+  if (Command)
+    expandResponseFileProvenance(*Command);
+  if (!Command)
+    Command = DelegatingCDB::getCompileCommandAfterPreparedFileRenames(File);
+  if (Command && Mangler)
+    Mangler(*Command, File);
+  return Command;
+}
+
 llvm::Error
 OverlayCDB::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
   if (renameSetIsNoop(Renames))
@@ -326,14 +387,14 @@ OverlayCDB::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
     return Err;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
-    Changed = std::move(Plan->ChangedFiles);
-    if (Plan->Generation == CommandGeneration) {
-      Commands = std::move(Plan->Commands);
-    } else {
-      for (const auto &Entry : Commands)
-        Changed.push_back(Entry.first().str());
-      Commands.clear();
+    if (Plan->Generation != CommandGeneration) {
+      auto Rebuilt = buildRenamePlanLocked(Renames, nullptr);
+      if (!Rebuilt)
+        return Rebuilt.takeError();
+      Plan = std::move(*Rebuilt);
     }
+    Changed = std::move(Plan->ChangedFiles);
+    Commands = std::move(Plan->Commands);
     ++CommandGeneration;
     Prepared.reset();
   }
@@ -362,6 +423,13 @@ llvm::Error DelegatingCDB::prepareFileRenames(
 void DelegatingCDB::discardPreparedFileRenames() const {
   if (Base)
     Base->discardPreparedFileRenames();
+}
+
+std::optional<tooling::CompileCommand>
+DelegatingCDB::getCompileCommandAfterPreparedFileRenames(PathRef File) const {
+  if (!Base)
+    return std::nullopt;
+  return Base->getCompileCommandAfterPreparedFileRenames(File);
 }
 
 } // namespace clangd

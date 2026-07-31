@@ -23,6 +23,8 @@ namespace clang {
 namespace clangd {
 namespace {
 
+constexpr uint64_t BinaryProbeBytes = 64 * 1024;
+
 template <typename T>
 bool mapsEqual(const llvm::StringMap<T> &L, const llvm::StringMap<T> &R) {
   if (L.size() != R.size())
@@ -150,10 +152,19 @@ struct WorkspaceSourceCache::Impl {
       return Entry;
     }
 
-    if (auto Err = addToTotal(Usage.ReadBytes, Status.getSize(),
+    const bool NeedsProbe = Status.getSize() > Limits.MaxTextFileBytes;
+    const uint64_t BytesToRead =
+        NeedsProbe ? std::min(Status.getSize(), BinaryProbeBytes)
+                   : Status.getSize();
+    if (auto Err = addToTotal(Usage.ReadBytes, BytesToRead,
                               Limits.MaxBytesRead, "bytes-read"))
       return std::move(Err);
-    auto Buffer = FS.getBufferForFile(File);
+    auto Buffer = NeedsProbe
+                      ? FS.getBufferForFile(File, BytesToRead,
+                                            /*RequiresNullTerminator=*/false,
+                                            /*IsVolatile=*/true,
+                                            /*IsText=*/false)
+                      : FS.getBufferForFile(File);
     if (!Buffer)
       return error("cannot read workspace file {0}: {1}", File,
                    Buffer.getError().message());
@@ -162,19 +173,21 @@ struct WorkspaceSourceCache::Impl {
       return error("cannot revalidate workspace file {0}: {1}", File,
                    Current.getError().message());
     if (!Current->isRegularFile() || !(metadata(*Current) == Entry.Meta) ||
-        Buffer.get()->getBufferSize() != Status.getSize())
+        Buffer.get()->getBufferSize() < BytesToRead ||
+        (!NeedsProbe &&
+         Buffer.get()->getBufferSize() != Status.getSize()))
       return error("workspace file changed while being inventoried: {0}", File);
 
-    llvm::StringRef Code = Buffer.get()->getBuffer();
+    llvm::StringRef Code = Buffer.get()->getBuffer().take_front(BytesToRead);
     Entry.ReadBytes = Code.size();
     if (Code.contains('\0')) {
       Entry.Classification = WorkspaceFileClassification::Binary;
       return Entry;
     }
-    if (Code.size() > Limits.MaxTextFileBytes)
+    if (NeedsProbe)
       return error("workspace text file {0} is {1} bytes, exceeding the {2}-"
                    "byte file-rename inventory limit",
-                   File, Code.size(), Limits.MaxTextFileBytes);
+                   File, Status.getSize(), Limits.MaxTextFileBytes);
 
     Entry.Digest = digest(Code);
     bool IsRelevant = IsKnownSource;

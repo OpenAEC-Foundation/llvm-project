@@ -47,11 +47,22 @@ struct ConditionalInclusion {
   int HashLine = 0;
 };
 
+struct UneditableFileDependency {
+  std::string Kind;
+  std::string Written;
+  bool IncludesDescendants = false;
+};
+
 struct FileRenameDirectiveScan {
   std::string Contents;
   FileDigest Digest{{0}};
   bool HasIncludeDirectives = false;
+  bool HasIncludeAliasPragma = false;
+  /// Literal header-name spellings for every textual inclusion. Empty entries
+  /// represent macro-generated operands.
+  std::vector<std::string> IncludeSpellings;
   std::vector<ConditionalInclusion> ConditionalIncludes;
+  std::vector<UneditableFileDependency> UneditableDependencies;
 };
 
 /// Reads and scans a frozen file once, returning both the exact contents and
@@ -59,9 +70,9 @@ struct FileRenameDirectiveScan {
 llvm::Expected<FileRenameDirectiveScan>
 scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS);
 
-/// Returns inclusion directives controlled by genuine preprocessor choices.
-/// A conventional whole-file include guard is not considered conditional.
-/// Written is empty when the operand is macro-generated.
+/// Returns inclusion directives controlled by preprocessor choices, including
+/// conventional whole-file include guards. Written is empty when the operand
+/// is macro-generated.
 llvm::Expected<std::vector<ConditionalInclusion>>
 conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS);
 

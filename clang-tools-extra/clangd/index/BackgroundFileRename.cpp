@@ -48,6 +48,10 @@ BackgroundIndex::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) {
   llvm::DenseSet<BackgroundIndexStorage *> StorageScheduledForClear;
   std::vector<BackgroundIndexStorage *> StoragesToClear;
   for (PathRef TU : IncompleteTUs) {
+    // A destination can change header lookup even when no recorded edge names
+    // a moved path. Every TU must therefore be rebuilt under the post-rename
+    // namespace; persisted context is retained only as an input to migration.
+    CachedAffectedTUs.insert(TU);
     auto NewTU = mapPathAfterRenames(TU, Renames);
     if (!NewTU)
       return NewTU.takeError();
@@ -122,6 +126,8 @@ BackgroundIndex::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) {
   {
     std::lock_guard<std::mutex> Lock(ShardVersionsMu);
     ScheduledRenameEpoch = RenameEpoch + 1;
+    for (PathRef TU : KnownTUs.keys())
+      AffectedTUs.insert(TU);
     for (const IndexedFile &File : IndexedFiles) {
       auto NewFile = mapPathAfterRenames(File.File, Renames);
       if (!NewFile)

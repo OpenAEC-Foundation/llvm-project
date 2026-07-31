@@ -161,21 +161,27 @@ TEST_F(LSPTest, Diagnostics) {
   EXPECT_THAT(Client.diagnostics("foo.cpp"), llvm::ValueIs(testing::IsEmpty()));
 }
 
-TEST_F(LSPTest, FileRenameRequiresVersionedDocumentChanges) {
-  auto InitializeParams = [](bool DocumentChanges) {
-    return llvm::json::Object{
-        {"capabilities",
-         llvm::json::Object{
-             {"workspace",
-              llvm::json::Object{
-                  {"workspaceEdit",
-                   llvm::json::Object{{"documentChanges", DocumentChanges}}},
-                  {"fileOperations",
-                   llvm::json::Object{{"willRename", true},
-                                      {"didRename", true}}}}}}}};
-  };
+llvm::json::Object fileRenameInitializeParams(bool DocumentChanges,
+                                              bool WithRoot = true) {
+  llvm::json::Object Result{
+      {"capabilities",
+       llvm::json::Object{
+           {"workspace",
+            llvm::json::Object{
+                {"workspaceEdit",
+                 llvm::json::Object{{"documentChanges", DocumentChanges}}},
+                {"fileOperations",
+                 llvm::json::Object{{"willRename", true},
+                                    {"didRename", true}}}}}}}};
+  if (WithRoot)
+    Result["rootUri"] = URIForFile::canonicalize(testRoot(), testRoot());
+  return Result;
+}
 
-  llvm::json::Value Initialize = startWithInitialize(InitializeParams(false));
+TEST_F(LSPTest, FileRenameRequiresVersionedDocumentChanges) {
+
+  llvm::json::Value Initialize =
+      startWithInitialize(fileRenameInitializeParams(false));
   const auto *Capabilities =
       Initialize.getAsObject()->getObject("capabilities");
   ASSERT_TRUE(Capabilities);
@@ -188,21 +194,41 @@ TEST_F(LSPTest, FileRenameRequiresVersionedDocumentChanges) {
 }
 
 TEST_F(LSPTest, AdvertisesFileRenameWithDocumentChanges) {
-  llvm::json::Object Params{
-      {"capabilities",
-       llvm::json::Object{
-           {"workspace",
-            llvm::json::Object{{"workspaceEdit",
-                                llvm::json::Object{{"documentChanges", true}}},
-                               {"fileOperations",
-                                llvm::json::Object{{"willRename", true}}}}}}}};
-  llvm::json::Value Initialize = startWithInitialize(std::move(Params));
+  Opts.BackgroundIndex = true;
+  llvm::json::Value Initialize =
+      startWithInitialize(fileRenameInitializeParams(true));
   const auto *Operations = Initialize.getAsObject()
                                ->getObject("capabilities")
                                ->getObject("workspace")
                                ->getObject("fileOperations");
   ASSERT_TRUE(Operations);
   EXPECT_TRUE(Operations->get("willRename"));
+}
+
+TEST_F(LSPTest, DoesNotAdvertiseWillRenameWithoutBackgroundIndex) {
+  Opts.BackgroundIndex = false;
+  llvm::json::Value NoIndex =
+      startWithInitialize(fileRenameInitializeParams(true));
+  const auto *Operations = NoIndex.getAsObject()
+                               ->getObject("capabilities")
+                               ->getObject("workspace")
+                               ->getObject("fileOperations");
+  ASSERT_TRUE(Operations);
+  EXPECT_FALSE(Operations->get("willRename"));
+  EXPECT_TRUE(Operations->get("didRename"));
+}
+
+TEST_F(LSPTest, DoesNotAdvertiseWillRenameWithoutWorkspaceRoot) {
+  Opts.BackgroundIndex = true;
+  llvm::json::Value NoWorkspace =
+      startWithInitialize(fileRenameInitializeParams(true, false));
+  const auto *Operations = NoWorkspace.getAsObject()
+                               ->getObject("capabilities")
+                               ->getObject("workspace")
+                               ->getObject("fileOperations");
+  ASSERT_TRUE(Operations);
+  EXPECT_FALSE(Operations->get("willRename"));
+  EXPECT_TRUE(Operations->get("didRename"));
 }
 
 TEST_F(LSPTest, DiagnosticsHeaderSaved) {

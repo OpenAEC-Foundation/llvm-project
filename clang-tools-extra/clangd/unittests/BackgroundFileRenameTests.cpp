@@ -46,7 +46,7 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesIncludeGraphAndShard) {
   tooling::CompileCommand Cmd;
   Cmd.Filename = Main;
   Cmd.Directory = testPath("root");
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   CDB.setCompileCommand(Main, Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
@@ -90,7 +90,7 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesCacheOnlyState) {
   tooling::CompileCommand Cmd;
   Cmd.Filename = Main;
   Cmd.Directory = testPath("root");
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   {
     OverlayCDB CDB(/*Base=*/nullptr);
     BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
@@ -136,7 +136,7 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesCacheOnlyState) {
   EXPECT_THAT(SymbolFiles, ElementsAre(URI::create(New).toString()));
 }
 
-TEST_F(BackgroundIndexTest, FileRenameOnlyReindexesAffectedContexts) {
+TEST_F(BackgroundIndexTest, FileRenameReindexesAllLookupContexts) {
   MockFS FS;
   const Path Main = testPath("root/main.cpp");
   const Path Old = testPath("root/old.h");
@@ -155,10 +155,10 @@ TEST_F(BackgroundIndexTest, FileRenameOnlyReindexesAffectedContexts) {
   tooling::CompileCommand Cmd;
   Cmd.Directory = testPath("root");
   Cmd.Filename = Main;
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   CDB.setCompileCommand(Main, Cmd);
   Cmd.Filename = Unrelated;
-  Cmd.CommandLine = {"clang++", Unrelated};
+  Cmd.CommandLine = {"clang++", "-c", Unrelated};
   CDB.setCompileCommand(Unrelated, Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
@@ -168,7 +168,7 @@ TEST_F(BackgroundIndexTest, FileRenameOnlyReindexesAffectedContexts) {
   FS.Files[Main] = "#include \"new.h\"\n";
   ASSERT_THAT_ERROR(Idx.filesRenamed({{Old, New}}), llvm::Succeeded());
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
-  EXPECT_FALSE(MSS.AccessedPaths.contains(Unrelated));
+  EXPECT_TRUE(MSS.AccessedPaths.contains(Unrelated));
 }
 
 TEST_F(BackgroundIndexTest, FileRenameInvalidatesActiveIndexingCommit) {
@@ -201,7 +201,7 @@ TEST_F(BackgroundIndexTest, FileRenameInvalidatesActiveIndexingCommit) {
   tooling::CompileCommand Cmd;
   Cmd.Directory = testPath("root");
   Cmd.Filename = Main;
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   CDB.setCompileCommand(Main, Cmd);
   {
     std::unique_lock<std::mutex> Lock(Mu);
@@ -251,7 +251,7 @@ TEST_F(BackgroundIndexTest, MalformedCacheClearWaitsForActiveIndexingCommit) {
     tooling::CompileCommand Cmd;
     Cmd.Directory = testPath("root");
     Cmd.Filename = File.str();
-    Cmd.CommandLine = {"clang++", File.str()};
+    Cmd.CommandLine = {"clang++", "-c", File.str()};
     return Cmd;
   };
   tooling::CompileCommand ActiveCmd = Command(Active);
@@ -405,7 +405,7 @@ TEST_F(BackgroundIndexTest, FileRenameInvalidatesQueuedCommandChange) {
     tooling::CompileCommand Cmd;
     Cmd.Filename = File.str();
     Cmd.Directory = testPath("root");
-    Cmd.CommandLine = {"clang++", File.str()};
+    Cmd.CommandLine = {"clang++", "-c", File.str()};
     return Cmd;
   };
   CDB.setCompileCommand(Blocker, Command(Blocker));
@@ -474,7 +474,7 @@ TEST_F(BackgroundIndexTest, FileRenameRejectsIncompleteTUsAtSameDestination) {
     tooling::CompileCommand Cmd;
     Cmd.Directory = testPath("root");
     Cmd.Filename = File.str();
-    Cmd.CommandLine = {"clang++", File.str()};
+    Cmd.CommandLine = {"clang++", "-c", File.str()};
     return Cmd;
   };
   CDB.setCompileCommand(First, command(First));
@@ -516,7 +516,7 @@ TEST_F(BackgroundIndexTest, DirectoryRenameInvalidatesBlockedCacheLoad) {
     tooling::CompileCommand Cmd;
     Cmd.Filename = Main;
     Cmd.Directory = testPath("root");
-    Cmd.CommandLine = {"clang++", Main};
+    Cmd.CommandLine = {"clang++", "-c", Main};
     {
       OverlayCDB CDB(/*Base=*/nullptr);
       BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
@@ -616,10 +616,10 @@ TEST_F(BackgroundIndexTest, IncludeGraphBuildIsInvalidatedByRenameEpoch) {
   tooling::CompileCommand Cmd;
   Cmd.Filename = Main;
   Cmd.Directory = testPath("root");
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   tooling::CompileCommand BlockerCmd = Cmd;
   BlockerCmd.Filename = Blocker;
-  BlockerCmd.CommandLine = {"clang++", Blocker};
+  BlockerCmd.CommandLine = {"clang++", "-c", Blocker};
   {
     OverlayCDB CDB(/*Base=*/nullptr);
     BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
@@ -697,7 +697,7 @@ TEST_F(BackgroundIndexTest, FailedFileRenameDoesNotMutateGraphOrStorage) {
   tooling::CompileCommand Cmd;
   Cmd.Directory = testPath("root");
   Cmd.Filename = Main;
-  Cmd.CommandLine = {"clang++", Main};
+  Cmd.CommandLine = {"clang++", "-c", Main};
   CDB.setCompileCommand(Main, Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
@@ -763,7 +763,7 @@ TEST_F(BackgroundIndexTest, FailedFileRenameDoesNotClearIncompleteCache) {
     tooling::CompileCommand Cmd;
     Cmd.Directory = testPath("root");
     Cmd.Filename = File.str();
-    Cmd.CommandLine = {"clang++", File.str()};
+    Cmd.CommandLine = {"clang++", "-c", File.str()};
     return Cmd;
   };
   CDB.setCompileCommand(Fresh, command(Fresh));

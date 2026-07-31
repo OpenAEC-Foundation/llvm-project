@@ -115,6 +115,25 @@ bool compilerLoadsConfigFile(const tooling::CompileCommand &Command) {
   return HadConfigFile;
 }
 
+llvm::Expected<unsigned>
+compilerDriverJobCount(const tooling::CompileCommand &Command) {
+  if (Command.CommandLine.empty())
+    return error("compiler command line is empty");
+  if (compilerInvocationMode(Command.CommandLine) ==
+      CompilerInvocationMode::DirectCC1)
+    return 1u;
+  std::vector<const char *> Args;
+  for (const std::string &Arg : Command.CommandLine)
+    Args.push_back(Arg.c_str());
+  unsigned JobCount = 0;
+  CreateInvocationOptions Options;
+  Options.RecoverOnError = true;
+  Options.DriverJobCount = &JobCount;
+  if (!createInvocation(Args, std::move(Options)))
+    return error("cannot derive compiler jobs from command");
+  return JobCount;
+}
+
 llvm::Expected<NormalizedCompilerCommand>
 normalizeCompilerCommand(const tooling::CompileCommand &Command) {
   if (Command.CommandLine.empty())
@@ -168,18 +187,16 @@ normalizeCompilerCommand(const tooling::CompileCommand &Command) {
     return error("compiler command has explicit configuration file");
 
   Result.EffectiveDirectory = Command.Directory;
-  for (const llvm::opt::Arg *Arg : Parsed)
-    if (Arg->getOption().matches(options::OPT_working_directory) ||
-        Arg->getOption().matches(options::OPT_working_directory_EQ)) {
-      Result.EffectiveDirectory =
-          absolutePath(Arg->getValue(), Command.Directory);
-      llvm::StringRef Value = Arg->getValue();
-      auto Span = locateValueSpan(Value, Result.EffectiveDirectory, FirstArg,
-                                  End, Raw, Command);
-      if (!Span)
-        return Span.takeError();
-      Result.WorkingDirectories.push_back(std::move(*Span));
-    }
+  if (const llvm::opt::Arg *Arg =
+          Parsed.getLastArg(options::OPT_working_directory)) {
+    Result.EffectiveDirectory =
+        absolutePath(Arg->getValue(), Command.Directory);
+    auto Span = locateValueSpan(Arg->getValue(), Result.EffectiveDirectory,
+                                FirstArg, End, Raw, Command);
+    if (!Span)
+      return Span.takeError();
+    Result.WorkingDirectory = std::move(*Span);
+  }
 
   auto RecordInput =
       [&](llvm::StringRef Value) -> llvm::Expected<CompilerInputArgument> {

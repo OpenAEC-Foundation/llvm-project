@@ -91,6 +91,38 @@ bool draftsEqual(llvm::ArrayRef<std::pair<Path, DraftStore::Draft>> Left,
   });
 }
 
+llvm::Error validateReparsedIncludeEdges(
+    PathRef File, const IncludeStructure &Reparsed,
+    llvm::ArrayRef<Path> IndexedEdges, llvm::vfs::FileSystem &FS) {
+  const auto &Actual = Reparsed.MainFileIncludes;
+  if (Actual.size() != IndexedEdges.size())
+    return error("standalone parse of {0} has {1} include edges, but its "
+                 "indexed translation-unit context has {2}",
+                 File, Actual.size(), IndexedEdges.size());
+  for (size_t I = 0; I < Actual.size(); ++I) {
+    if (Actual[I].Resolved.empty())
+      return error("standalone parse of {0} has an unresolved include at "
+                   "offset {1}",
+                   File, Actual[I].HashOffset);
+    auto ActualStatus = FS.status(Actual[I].Resolved);
+    if (!ActualStatus)
+      return error("cannot inspect reparsed include {0} from {1}: {2}",
+                   Actual[I].Resolved, File,
+                   ActualStatus.getError().message());
+    auto IndexedStatus = FS.status(IndexedEdges[I]);
+    if (!IndexedStatus)
+      return error("cannot inspect indexed include {0} from {1}: {2}",
+                   IndexedEdges[I], File,
+                   IndexedStatus.getError().message());
+    if (ActualStatus->getUniqueID() != IndexedStatus->getUniqueID())
+      return error("standalone parse of {0} resolves include {1} to {2}, but "
+                   "its indexed translation-unit context resolves it to {3}",
+                   File, Actual[I].Written, Actual[I].Resolved,
+                   IndexedEdges[I]);
+  }
+  return llvm::Error::success();
+}
+
 llvm::Expected<std::optional<int64_t>>
 draftVersion(const DraftStore::Draft *Draft, PathRef File) {
   if (!Draft)
@@ -138,9 +170,38 @@ void ClangdServer::prepareFileRename(
         if (!Workspace)
           return CB(Workspace.takeError());
         const auto &WorkspaceFiles = Workspace->Sources;
+        for (const auto &Rename : Renames) {
+          Path Old = removeDots(Rename.first);
+          Path New = removeDots(Rename.second);
+          static constexpr llvm::StringLiteral MetadataFiles[] = {
+              ".clangd", "compile_commands.json", "compile_flags.txt"};
+          for (llvm::StringLiteral Metadata : MetadataFiles)
+            if (llvm::sys::path::filename(Old) == Metadata ||
+                llvm::sys::path::filename(New) == Metadata)
+              return CB(error("cannot rename configuration or compilation "
+                              "database file {0}",
+                              Old));
+          for (PathRef Pruned : Workspace->PrunedMetadataRoots.keys())
+            if (pathStartsWith(Old, Pruned) || pathStartsWith(Pruned, Old) ||
+                pathStartsWith(New, Pruned) || pathStartsWith(Pruned, New))
+              return CB(error("file rename intersects unscanned metadata root "
+                              "{0}",
+                              Pruned));
+          if (llvm::sys::path::parent_path(Old) !=
+              llvm::sys::path::parent_path(New))
+            return CB(error("cannot prove file rename across configuration "
+                            "or compilation-database directories: {0} to {1}",
+                            Old, New));
+        }
         auto Mappings = expandFileRenames(Renames, *WorkspaceRoot, *FS);
         if (!Mappings)
           return CB(Mappings.takeError());
+        for (const auto &Mapping : *Mappings)
+          if (llvm::sys::path::parent_path(Mapping.OldPath) !=
+              llvm::sys::path::parent_path(Mapping.NewPath))
+            return CB(error("cannot prove file rename across configuration "
+                            "or compilation-database directories: {0} to {1}",
+                            Mapping.OldPath, Mapping.NewPath));
         // Every standalone source must trigger project discovery. The CDB
         // broadcaster is asynchronous, so wait for it before waiting for the
         // indexing work that its notification creates.
@@ -161,6 +222,16 @@ void ClangdServer::prepareFileRename(
         if (Graph->Files.empty())
           return CB(error("background include graph is empty"));
 
+        llvm::StringMap<FileDigest> GraphDigests;
+        for (const auto &Node : Graph->Files) {
+          auto [It, Inserted] =
+              GraphDigests.try_emplace(Node.File, Node.Digest);
+          if (!Inserted && It->getValue() != Node.Digest)
+            return CB(error("background contexts disagree on the digest for "
+                            "{0}",
+                            Node.File));
+        }
+
         FileRenameDirectiveCache DirectiveScans(*FS);
         auto ScanDirectives = [&](PathRef File)
             -> llvm::Expected<const FileRenameDirectiveScan *> {
@@ -169,9 +240,14 @@ void ClangdServer::prepareFileRename(
             ExpectedDigest = digest(*Draft->Contents);
           } else {
             auto Expected = Workspace->Digests.find(File);
-            if (Expected == Workspace->Digests.end())
-              return error("workspace inventory has no digest for {0}", File);
-            ExpectedDigest = Expected->getValue();
+            if (Expected != Workspace->Digests.end())
+              ExpectedDigest = Expected->getValue();
+            else {
+              auto Indexed = GraphDigests.find(File);
+              if (Indexed == GraphDigests.end())
+                return error("no frozen digest is available for {0}", File);
+              ExpectedDigest = Indexed->getValue();
+            }
           }
           return DirectiveScans.scan(File, ExpectedDigest);
         };
@@ -215,6 +291,36 @@ void ClangdServer::prepareFileRename(
               {Command.first().str(), Command.getValue()});
         }
 
+        if (auto Err = CDB.prepareFileRenames(Renames, ValidatedCommands))
+          return CB(std::move(Err));
+        llvm::scope_exit DiscardCDBPlan(
+            [&] { CDB.discardPreparedFileRenames(); });
+        for (const auto &Command : Graph->Commands) {
+          auto NewTU = mapPathAfterRenames(Command.first(), Renames);
+          if (!NewTU)
+            return CB(NewTU.takeError());
+          if (*NewTU == Command.first())
+            continue;
+          WithContext DestinationContext(
+              ContextProvider ? ContextProvider(*NewTU)
+                              : Context::current().clone());
+          auto Future =
+              CDB.getCompileCommandAfterPreparedFileRenames(*NewTU);
+          if (!Future)
+            return CB(error("no post-rename compilation command is available "
+                            "for {0}",
+                            *NewTU));
+          tooling::CompileCommand Expected = tooling::transferCompileCommand(
+              Command.getValue(), *NewTU);
+          if (Future->Directory != Expected.Directory ||
+              Future->CommandLine != Expected.CommandLine ||
+              Future->HadResponseFile != Expected.HadResponseFile ||
+              Future->HadConfigFile != Expected.HadConfigFile)
+            return CB(error("compilation command or configuration changes "
+                            "when {0} is renamed to {1}",
+                            Command.first(), *NewTU));
+        }
+
         auto InWorkspace = [&](PathRef File) {
           return File == *WorkspaceRoot || pathStartsWith(*WorkspaceRoot, File);
         };
@@ -242,15 +348,10 @@ void ClangdServer::prepareFileRename(
         // its old graph had no includes and it would not otherwise become an
         // edit candidate.
         llvm::StringMap<FileDigest> IndexedDigests;
-        for (const auto &Node : Graph->Files) {
-          if (!InWorkspace(Node.File) || findDraft(Drafts, Node.File))
+        for (const auto &Entry : GraphDigests) {
+          if (!InWorkspace(Entry.first()) || findDraft(Drafts, Entry.first()))
             continue;
-          auto [It, Inserted] =
-              IndexedDigests.try_emplace(Node.File, Node.Digest);
-          if (!Inserted && It->getValue() != Node.Digest)
-            return CB(error("background contexts disagree on the digest for "
-                            "{0}",
-                            Node.File));
+          IndexedDigests.try_emplace(Entry.first(), Entry.getValue());
         }
         for (const auto &Entry : IndexedDigests) {
           auto Current = Workspace->Digests.find(Entry.first());
@@ -273,12 +374,73 @@ void ClangdServer::prepareFileRename(
           });
         };
 
+        bool HasIncludeAliasState = false;
+        llvm::StringMap<FileDigest> ExternalDigests;
+        WorkspaceSourceLimits ProofLimits;
+        uint64_t ProofFiles = 0;
+        uint64_t ProofBytes = 0;
+        auto AccountDirectiveScan = [&](PathRef File,
+                                        const FileRenameDirectiveScan &Scan)
+            -> llvm::Error {
+          if (ProofFiles == ProofLimits.MaxFiles)
+            return error("file-rename dependency proof exceeds the file-count "
+                         "limit of {0}",
+                         ProofLimits.MaxFiles);
+          ++ProofFiles;
+          uint64_t Size = Scan.Contents.size();
+          if (Size > ProofLimits.MaxTextFileBytes ||
+              ProofBytes > ProofLimits.MaxDirectiveScanBytes - Size)
+            return error("file-rename dependency proof exceeds its scan-byte "
+                         "limit while reading {0}",
+                         File);
+          ProofBytes += Size;
+          return llvm::Error::success();
+        };
+        for (const auto &Entry : Workspace->Digests) {
+          auto Scan = ScanDirectives(Entry.first());
+          if (!Scan)
+            return CB(Scan.takeError());
+          if (auto Err = AccountDirectiveScan(Entry.first(), **Scan))
+            return CB(std::move(Err));
+          HasIncludeAliasState |= (*Scan)->HasIncludeAliasPragma;
+          for (const auto &Dependency : (*Scan)->UneditableDependencies)
+            return CB(error("cannot prove file rename with {0} in {1}: {2}",
+                            Dependency.Kind, Entry.first(),
+                            Dependency.Written.empty()
+                                ? llvm::StringRef("<unresolved>")
+                                : llvm::StringRef(Dependency.Written)));
+        }
+        for (const auto &Node : Graph->Files) {
+          if (InWorkspace(Node.File))
+            continue;
+          auto [DigestIt, Inserted] =
+              ExternalDigests.try_emplace(Node.File, Node.Digest);
+          if (!Inserted && DigestIt->getValue() != Node.Digest)
+            return CB(error("background contexts disagree on the digest for "
+                            "external file {0}",
+                            Node.File));
+          auto Scan = DirectiveScans.scan(Node.File, Node.Digest);
+          if (!Scan)
+            return CB(Scan.takeError());
+          if (Inserted)
+            if (auto Err = AccountDirectiveScan(Node.File, **Scan))
+              return CB(std::move(Err));
+          HasIncludeAliasState |= (*Scan)->HasIncludeAliasPragma;
+          for (const auto &Dependency : (*Scan)->UneditableDependencies)
+            return CB(error("cannot prove file rename with {0} outside the "
+                            "workspace in {1}",
+                            Dependency.Kind, Node.File));
+        }
+        if (HasIncludeAliasState)
+          return CB(error("cannot prove file rename with #pragma "
+                          "include_alias state"));
+
         llvm::StringMap<std::vector<const BackgroundIndex::IndexedFile *>>
             Candidates;
-        llvm::StringSet<> ActiveCandidates;
         for (const auto &Node : Graph->Files) {
-          if (!InWorkspace(Node.File))
-            continue;
+          auto Scan = ScanDirectives(Node.File);
+          if (!Scan)
+            return CB(Scan.takeError());
           auto Affected = IsRenamed(Node.File);
           if (!Affected)
             return CB(Affected.takeError());
@@ -294,20 +456,30 @@ void ClangdServer::prepareFileRename(
               return CB(IncludedAffected.takeError());
             *Affected = *IncludedAffected;
           }
-          bool HasLiteralConditionalInclude = false;
-          if (Node.HasConditionalIncludes) {
-            auto Scan = ScanDirectives(Node.File);
-            if (!Scan)
-              return CB(Scan.takeError());
-            HasLiteralConditionalInclude = llvm::any_of(
-                (*Scan)->ConditionalIncludes, [](const auto &Inclusion) {
-                  return !Inclusion.Written.empty() &&
-                         Inclusion.Directive != tok::pp_include_next;
+          bool DestinationMayChangeLookup = llvm::any_of(
+              (*Scan)->IncludeSpellings, [&](llvm::StringRef Written) {
+                if (Written.size() < 2)
+                  return true;
+                llvm::StringRef Name = Written.drop_front().drop_back();
+                return llvm::any_of(*Mappings, [&](const auto &Mapping) {
+                  return llvm::sys::path::filename(Name) ==
+                         llvm::sys::path::filename(Mapping.NewPath);
                 });
+              });
+          if (!InWorkspace(Node.File)) {
+            if (*Affected || DestinationMayChangeLookup)
+              return CB(error("file rename requires editing an includer "
+                              "outside the workspace: {0}",
+                              Node.File));
+            continue;
           }
-          if (*Affected)
-            ActiveCandidates.insert(Node.File);
-          if (*Affected || HasLiteralConditionalInclude)
+          bool HasConditionalInclude = false;
+          if (Node.Flags &
+              IncludeGraphNode::SourceFlag::HasConditionalIncludes) {
+            HasConditionalInclude = !(*Scan)->ConditionalIncludes.empty();
+          }
+          if (*Affected || HasConditionalInclude ||
+              DestinationMayChangeLookup)
             Candidates[Node.File].push_back(&Node);
         }
 
@@ -349,11 +521,10 @@ void ClangdServer::prepareFileRename(
             ClosedCandidates.insert(File);
           std::vector<ConditionalInclusion> Conditional =
               (*Scan)->ConditionalIncludes;
-          if (!ActiveCandidates.contains(File))
-            llvm::erase_if(Conditional, [](const auto &Inclusion) {
-              return Inclusion.Written.empty() ||
-                     Inclusion.Directive == tok::pp_include_next;
-            });
+          if (!Conditional.empty() && (*Scan)->HasIncludeAliasPragma)
+            return CB(error("cannot resolve conditional includes in {0} "
+                            "with #pragma include_alias state",
+                            File));
           ConditionalIncludes[File] = std::move(Conditional);
           for (const auto *Context : Candidate.getValue())
             if (!findDraft(Drafts, File) &&
@@ -367,6 +538,12 @@ void ClangdServer::prepareFileRename(
           PathRef File = Candidate.first();
           for (const BackgroundIndex::IndexedFile *Context :
                Candidate.getValue()) {
+            auto DestinationFile = mapPathAfterRenames(File, Renames);
+            if (!DestinationFile)
+              return CB(DestinationFile.takeError());
+            WithContext FileContext(
+                ContextProvider ? ContextProvider(*DestinationFile)
+                                : Context::current().clone());
             auto Command = Graph->Commands.find(Context->DependentTU);
             if (Command == Graph->Commands.end())
               return CB(error("no indexed compilation command is available "
@@ -401,36 +578,40 @@ void ClangdServer::prepareFileRename(
                               File));
 
             IncludeStructure Includes = AST->getIncludeStructure();
+            FileDigest ParsedDigest = digest(Inputs.Contents);
+            if (File != Context->DependentTU &&
+                ParsedDigest != Context->Digest)
+              return CB(error("cannot prove translation-unit context for "
+                              "modified open header {0}",
+                              File));
+            if (ParsedDigest == Context->Digest)
+              if (auto Err = validateReparsedIncludeEdges(
+                      File, Includes, Context->DirectIncludes, *FS))
+                return CB(std::move(Err));
             const auto &Conditional = ConditionalIncludes.lookup(File);
-            if (!Conditional.empty()) {
-              std::string ProbeCode;
-              for (const ConditionalInclusion &Inclusion : Conditional) {
-                if (Inclusion.Written.empty())
-                  return CB(error("cannot resolve macro-generated conditional "
-                                  "include in {0}",
-                                  File));
-                llvm::StringRef Keyword;
-                switch (Inclusion.Directive) {
-                case tok::pp_include:
-                  Keyword = "include";
-                  break;
-                case tok::pp_import:
-                  Keyword = "import";
-                  break;
-                case tok::pp_include_next:
-                  return CB(error("cannot resolve conditional #include_next "
-                                  "in {0}",
-                                  File));
-                default:
-                  llvm_unreachable("unexpected conditional inclusion kind");
-                }
-                ProbeCode += "#";
-                ProbeCode += Keyword;
-                ProbeCode += " ";
-                ProbeCode += Inclusion.Written;
-                ProbeCode += "\n";
+            for (const ConditionalInclusion &Inclusion : Conditional) {
+              if (Inclusion.Written.empty())
+                return CB(error("cannot resolve macro-generated conditional "
+                                "include in {0}",
+                                File));
+              llvm::StringRef Keyword;
+              switch (Inclusion.Directive) {
+              case tok::pp_include:
+                Keyword = "include";
+                break;
+              case tok::pp_import:
+                Keyword = "import";
+                break;
+              case tok::pp_include_next:
+                return CB(error("cannot resolve conditional #include_next "
+                                "in {0}",
+                                File));
+              default:
+                llvm_unreachable("unexpected conditional inclusion kind");
               }
-              ParseInputs ProbeInputs{std::move(ProbeCommand), &SnapshotFS,
+              std::string ProbeCode =
+                  ("#" + Keyword + " " + Inclusion.Written + "\n").str();
+              ParseInputs ProbeInputs{ProbeCommand, &SnapshotFS,
                                       std::move(ProbeCode)};
               ProbeInputs.Index = Index;
               ProbeInputs.FeatureModules = FeatureModules;
@@ -452,27 +633,22 @@ void ClangdServer::prepareFileRename(
                                 File));
               const auto &Resolved =
                   ProbeAST->getIncludeStructure().MainFileIncludes;
-              if (Resolved.size() != Conditional.size())
+              if (Resolved.size() != 1 ||
+                  Resolved.front().Written != Inclusion.Written ||
+                  Resolved.front().Resolved.empty())
                 return CB(error("cannot exhaustively resolve conditional "
-                                "includes in {0}",
-                                File));
-              for (size_t I = 0; I < Conditional.size(); ++I) {
-                if (Resolved[I].Written != Conditional[I].Written ||
-                    Resolved[I].Resolved.empty())
-                  return CB(error("cannot exhaustively resolve conditional "
-                                  "include {0} in {1}",
-                                  Conditional[I].Written, File));
-                if (llvm::any_of(Includes.MainFileIncludes,
-                                 [&](const Inclusion &Existing) {
-                                   return Existing.HashOffset ==
-                                          Conditional[I].HashOffset;
-                                 }))
-                  continue;
-                Inclusion Synthesized = Resolved[I];
-                Synthesized.HashOffset = Conditional[I].HashOffset;
-                Synthesized.HashLine = Conditional[I].HashLine;
-                Includes.MainFileIncludes.push_back(std::move(Synthesized));
-              }
+                                "include {0} in {1}",
+                                Inclusion.Written, File));
+              if (llvm::any_of(Includes.MainFileIncludes,
+                               [&](const clangd::Inclusion &Existing) {
+                                 return Existing.HashOffset ==
+                                        Inclusion.HashOffset;
+                               }))
+                continue;
+              clangd::Inclusion Synthesized = Resolved.front();
+              Synthesized.HashOffset = Inclusion.HashOffset;
+              Synthesized.HashLine = Inclusion.HashLine;
+              Includes.MainFileIncludes.push_back(std::move(Synthesized));
             }
 
             auto Style =
@@ -491,11 +667,6 @@ void ClangdServer::prepareFileRename(
           }
         }
 
-        if (auto Err = CDB.prepareFileRenames(Renames, ValidatedCommands))
-          return CB(std::move(Err));
-        llvm::scope_exit DiscardCDBPlan(
-            [&] { CDB.discardPreparedFileRenames(); });
-
         // Closed documents can change independently of DraftStore. Re-read
         // only the affected closed files and reject a mixed snapshot.
         for (PathRef File : ClosedCandidates.keys()) {
@@ -512,6 +683,16 @@ void ClangdServer::prepareFileRename(
           return CB(llvm::make_error<LSPError>(
               "open documents changed while preparing file rename",
               ErrorCode::ContentModified));
+        FileRenameDirectiveCache ExternalRecheck(*FS);
+        for (const auto &Entry : ExternalDigests) {
+          auto Scan = ExternalRecheck.scan(Entry.first(), Entry.getValue());
+          if (!Scan) {
+            llvm::consumeError(Scan.takeError());
+            return CB(llvm::make_error<LSPError>(
+                "external dependency changed while preparing file rename",
+                ErrorCode::ContentModified));
+          }
+        }
         auto CurrentWorkspace = FileRenameWorkspace->snapshot(*FS);
         if (!CurrentWorkspace)
           return CB(CurrentWorkspace.takeError());
