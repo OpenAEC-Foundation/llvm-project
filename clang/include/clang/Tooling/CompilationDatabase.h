@@ -65,10 +65,20 @@ struct CompileCommand {
   /// e.g. "inferred from foo/bar.h".
   std::string Heuristic;
 
+  /// True if response-file indirection was observed before CommandLine was
+  /// expanded. Consumers that must rewrite raw argument provenance can reject
+  /// such commands even after the @file token is gone.
+  bool HadResponseFile = false;
+
+  /// True if the driver loaded an explicit or implicit configuration file.
+  bool HadConfigFile = false;
+
   friend bool operator==(const CompileCommand &LHS, const CompileCommand &RHS) {
     return LHS.Directory == RHS.Directory && LHS.Filename == RHS.Filename &&
            LHS.CommandLine == RHS.CommandLine && LHS.Output == RHS.Output &&
-           LHS.Heuristic == RHS.Heuristic;
+           LHS.Heuristic == RHS.Heuristic &&
+           LHS.HadResponseFile == RHS.HadResponseFile &&
+           LHS.HadConfigFile == RHS.HadConfigFile;
   }
 
   friend bool operator!=(const CompileCommand &LHS, const CompileCommand &RHS) {
@@ -126,8 +136,8 @@ public:
   /// $ clang++ -o production a.cc b.cc -DPRODUCTION
   /// A compilation database representing the project would return both command
   /// lines for a.cc and b.cc and only the first command line for t.cc.
-  virtual std::vector<CompileCommand> getCompileCommands(
-      StringRef FilePath) const = 0;
+  virtual std::vector<CompileCommand>
+  getCompileCommands(StringRef FilePath) const = 0;
 
   /// Returns the list of all files available in the compilation database.
   ///

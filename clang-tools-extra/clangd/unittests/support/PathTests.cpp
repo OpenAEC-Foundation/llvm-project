@@ -47,9 +47,23 @@ TEST(PathTests, MapPathAfterRenames) {
                           {{testPath("old/"), testPath("new/./")}}),
       llvm::HasValue(testPath("new/file.cc")));
   EXPECT_THAT_EXPECTED(
+      mapPathAfterRenames(testPath("old/file.cc"),
+                          {{testPath("old/./"), testPath("old")},
+                           {testPath("old"), testPath("new")}}),
+      llvm::HasValue(testPath("new/file.cc")));
+  EXPECT_THAT_EXPECTED(
+      mapPathAfterRenames(testPath("case/Foo.h"),
+                          {{testPath("case/Foo.h"), testPath("case/foo.h")}}),
+      llvm::HasValue(testPath("case/foo.h")));
+  EXPECT_THAT_EXPECTED(
       mapPathAfterRenames(testPath("a/file.cc"),
                           {{testPath("a"), testPath("b")},
                            {testPath("a/file.cc"), testPath("c.cc")}}),
+      llvm::Failed());
+  EXPECT_THAT_EXPECTED(
+      mapPathAfterRenames(testPath("case/Foo.h"),
+                          {{testPath("case/Foo.h"), testPath("case/foo.h")},
+                           {testPath("case/Foo.h"), testPath("case/FOO.h")}}),
       llvm::Failed());
 }
 } // namespace

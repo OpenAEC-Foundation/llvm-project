@@ -47,6 +47,7 @@ struct VariantEntry {
   std::optional<clang::clangd::IncludeGraphNode> Source;
   std::optional<clang::clangd::IncludeGraphNode> ContextSource;
   std::optional<clang::tooling::CompileCommand> Cmd;
+  std::optional<std::vector<std::string>> CC1CommandLine;
 };
 // A class helps YAML to serialize the 32-bit encoded position (Line&Column),
 // as YAMLIO can't directly map bitfields.
@@ -402,6 +403,8 @@ template <> struct MappingTraits<CompileCommandYAML> {
   static void mapping(IO &IO, CompileCommandYAML &Cmd) {
     IO.mapRequired("Directory", Cmd.Directory);
     IO.mapRequired("CommandLine", Cmd.CommandLine);
+    IO.mapRequired("HadResponseFile", Cmd.HadResponseFile);
+    IO.mapRequired("HadConfigFile", Cmd.HadConfigFile);
   }
 };
 
@@ -432,6 +435,10 @@ template <> struct MappingTraits<VariantEntry> {
         Variant.Cmd.emplace();
       MappingTraits<CompileCommandYAML>::mapping(
           IO, static_cast<CompileCommandYAML &>(*Variant.Cmd));
+    } else if (IO.mapTag("!CC1Command", Variant.CC1CommandLine.has_value())) {
+      if (!IO.outputting())
+        Variant.CC1CommandLine.emplace();
+      IO.mapRequired("CommandLine", *Variant.CC1CommandLine);
     }
   }
 };
@@ -461,23 +468,28 @@ void writeYAML(const IndexFileOut &O, llvm::raw_ostream &OS) {
       Entry.Relation = R;
       Yout << Entry;
     }
-  if (O.Sources) {
-    for (const auto &Source : *O.Sources) {
+  auto WriteGraph = [&](const IncludeGraph *Graph, bool ExactContext) {
+    if (!Graph)
+      return;
+    for (const auto &Source : *Graph) {
       VariantEntry Entry;
-      Entry.Source = Source.getValue();
+      if (ExactContext)
+        Entry.ContextSource = Source.getValue();
+      else
+        Entry.Source = Source.getValue();
       Yout << Entry;
     }
-  }
-  if (O.ContextSources) {
-    for (const auto &Source : *O.ContextSources) {
-      VariantEntry Entry;
-      Entry.ContextSource = Source.getValue();
-      Yout << Entry;
-    }
-  }
+  };
+  WriteGraph(O.Sources, /*ExactContext=*/false);
+  WriteGraph(O.ContextSources, /*ExactContext=*/true);
   if (O.Cmd) {
     VariantEntry Entry;
     Entry.Cmd = *O.Cmd;
+    Yout << Entry;
+  }
+  if (O.CC1CommandLine) {
+    VariantEntry Entry;
+    Entry.CC1CommandLine = *O.CC1CommandLine;
     Yout << Entry;
   }
 }
@@ -494,6 +506,7 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
   IncludeGraph Sources;
   IncludeGraph ContextSources;
   std::optional<tooling::CompileCommand> Cmd;
+  std::optional<std::vector<std::string>> CC1CommandLine;
   while (Yin.setCurrentDocument()) {
     llvm::yaml::EmptyContext Ctx;
     VariantEntry Variant;
@@ -512,23 +525,20 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
       Relations.insert(*Variant.Relation);
     if (Variant.Source) {
       auto &IGN = *Variant.Source;
-      auto Entry = Sources.try_emplace(IGN.URI).first;
-      Entry->getValue() = std::move(IGN);
-      // Fixup refs to refer to map keys which will live on
-      Entry->getValue().URI = Entry->getKey();
-      for (auto &Include : Entry->getValue().DirectIncludes)
-        Include = Sources.try_emplace(Include).first->getKey();
+      if (auto Err = addSerializedIncludeGraphNode(Sources, std::move(IGN)))
+        return std::move(Err);
     }
     if (Variant.ContextSource) {
       auto &IGN = *Variant.ContextSource;
-      auto Entry = ContextSources.try_emplace(IGN.URI).first;
-      Entry->getValue() = std::move(IGN);
-      Entry->getValue().URI = Entry->getKey();
-      for (auto &Include : Entry->getValue().DirectIncludes)
-        Include = ContextSources.try_emplace(Include).first->getKey();
+      if (auto Err =
+              addSerializedIncludeGraphNode(ContextSources, std::move(IGN),
+                                            /*ExactContext=*/true))
+        return std::move(Err);
     }
     if (Variant.Cmd)
       Cmd = *Variant.Cmd;
+    if (Variant.CC1CommandLine)
+      CC1CommandLine = std::move(*Variant.CC1CommandLine);
     Yin.nextDocument();
   }
 
@@ -539,8 +549,12 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
   if (Sources.size())
     Result.Sources = std::move(Sources);
   if (ContextSources.size())
+    if (auto Err = validateContextIncludeGraph(ContextSources))
+      return std::move(Err);
+  if (ContextSources.size())
     Result.ContextSources = std::move(ContextSources);
   Result.Cmd = std::move(Cmd);
+  Result.CC1CommandLine = std::move(CC1CommandLine);
   return std::move(Result);
 }
 

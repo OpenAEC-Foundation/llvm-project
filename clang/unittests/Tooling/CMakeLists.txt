@@ -5,6 +5,7 @@ add_clang_unittest(ToolingTests
   CompilationDatabaseTest.cpp
   DiagnosticsYamlTest.cpp
   ExecutionTest.cpp
+  ExpandResponseFilesCompilationDatabaseTest.cpp
   FixItTest.cpp
   HeaderAnalysisTest.cpp
   HeaderIncludesTest.cpp

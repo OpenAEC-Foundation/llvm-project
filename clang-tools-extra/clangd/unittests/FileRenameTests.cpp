@@ -157,6 +157,9 @@ TEST(FileRename, ExpandsDirectoriesAndRejectsConflictingMappings) {
   MockFS FS;
   FS.Files[testPath("old/a.h")] = "";
   FS.Files[testPath("old/nested/b.h")] = "";
+  FS.Files[testPath("old/.git/ignored.h")] = "";
+  FS.Files[testPath("old/.hg/ignored.h")] = "";
+  FS.Files[testPath("old/.svn/ignored.h")] = "";
   auto VFS = FS.view(std::nullopt);
   auto Expanded =
       expandFileRenames({{testPath("old"), testPath("new")}}, testRoot(), *VFS);
@@ -167,6 +170,11 @@ TEST(FileRename, ExpandsDirectoriesAndRejectsConflictingMappings) {
                                             testPath("new/a.h")),
                              testing::Field(&FileRenameMapping::NewPath,
                                             testPath("new/nested/b.h"))));
+
+  auto Metadata = expandFileRenames(
+      {{testPath("old/.git"), testPath("metadata")}}, testRoot(), *VFS);
+  ASSERT_THAT_EXPECTED(Metadata, llvm::Succeeded());
+  EXPECT_TRUE(Metadata->empty());
 
   auto Conflict =
       expandFileRenames({{testPath("old/a.h"), testPath("new/a.h")},
@@ -313,6 +321,7 @@ TEST(FileRename, RejectsMovedCompilerConfigurationPaths) {
            std::vector<std::string>{"clang",
                                     "-fmodule-map-file=/workspace/config"},
        }) {
+    Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
     EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
                       llvm::FailedWithMessage(HasSubstr("compiler path")));
@@ -391,6 +400,7 @@ TEST(FileRename, RejectsAllIncludeModuleAndVFSCompilerPaths) {
            std::vector<std::string>{"clang", "-Xclang", "-chain-include",
                                     "-Xclang", "/workspace/config/header.pch"},
        }) {
+    Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
     EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
                       llvm::FailedWithMessage(HasSubstr("compiler path")));
@@ -402,8 +412,8 @@ TEST(FileRename, ResolvesIncludePrefixOptionsBeforeValidation) {
   Command.Directory = "/workspace/build";
   Command.Filename = "/workspace/main.cpp";
   for (llvm::StringRef WithPrefix : {"-iwithprefix", "-iwithprefixbefore"}) {
-    Command.CommandLine = {"clang", "-iprefix", "/workspace/sdk/",
-                           WithPrefix.str(), "include"};
+    Command.CommandLine = {"clang",          "-iprefix", "/workspace/sdk/",
+                           WithPrefix.str(), "include",  Command.Filename};
     EXPECT_THAT_ERROR(
         validateCompileCommandForRenames(
             Command, {{"/workspace/sdk/include", "/workspace/sdk/renamed"}}),
@@ -423,6 +433,7 @@ TEST(FileRename, ResolvesSysrootSearchOptionsBeforeValidation) {
            std::vector<std::string>{"clang", "-isysroot", "/workspace/sdk",
                                     "-I=include"},
        }) {
+    Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
     EXPECT_THAT_ERROR(
         validateCompileCommandForRenames(
@@ -473,132 +484,12 @@ TEST(FileRename, RejectsCompilerPathAliasingRenamedFile) {
   tooling::CompileCommand Command;
   Command.Directory = Workspace.str().str();
   Command.Filename = FilePath("main.cpp");
-  Command.CommandLine = {"clang", "-include", Alias};
+  Command.CommandLine = {"clang", "-include", Alias, Command.Filename};
   const std::pair<Path, Path> Rename{Config, Renamed};
 
   EXPECT_THAT_ERROR(
       validateCompileCommandForRenames(Command, {Rename}, {Mapping}, FS.get()),
       llvm::FailedWithMessage(HasSubstr("compiler path")));
-}
-
-TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
-  MockFS FS;
-  FS.Files[testPath("main.cpp")] = "";
-  FS.Files[testPath("include/header.h")] = "";
-  FS.Files[testPath("include/fragment.inc")] = "#include \"old.h\"\n";
-  FS.Files[testPath("generated")] = "#include <old.h>\n";
-  FS.Files[testPath("README.md")] = "";
-  FS.Files[testPath("artifact.bin")] =
-      std::string("binary\0incidental include bytes", 31);
-  auto VFS = FS.view(std::nullopt);
-
-  auto Files = workspaceSourceFiles(testRoot(), *VFS);
-  ASSERT_THAT_EXPECTED(Files, llvm::Succeeded());
-  EXPECT_THAT(
-      *Files,
-      testing::UnorderedElementsAre(
-          testing::AllOf(
-              testing::Field(&WorkspaceSourceFile::File, testPath("main.cpp")),
-              testing::Field(&WorkspaceSourceFile::IsHeader, false)),
-          testing::AllOf(testing::Field(&WorkspaceSourceFile::File,
-                                        testPath("include/header.h")),
-                         testing::Field(&WorkspaceSourceFile::IsHeader, true)),
-          testing::AllOf(testing::Field(&WorkspaceSourceFile::File,
-                                        testPath("include/fragment.inc")),
-                         testing::Field(&WorkspaceSourceFile::IsHeader, true)),
-          testing::AllOf(
-              testing::Field(&WorkspaceSourceFile::File, testPath("generated")),
-              testing::Field(&WorkspaceSourceFile::IsHeader, true))));
-}
-
-TEST(FileRename, EnforcesWorkspaceInventoryFileSizeLimit) {
-  for (bool KnownSource : {false, true}) {
-    const Path File = testPath(KnownSource ? "boundary.cpp" : "boundary.dat");
-    MockFS FS;
-    FS.Files[File] = std::string(MaxWorkspaceSourceFileSize, 'x');
-    auto VFS = FS.view(std::nullopt);
-    auto Files = workspaceSourceFiles(testRoot(), *VFS);
-    ASSERT_THAT_EXPECTED(Files, llvm::Succeeded());
-    if (KnownSource)
-      EXPECT_THAT(*Files, ElementsAre(testing::Field(&WorkspaceSourceFile::File,
-                                                     File)));
-    else
-      EXPECT_TRUE(Files->empty());
-  }
-
-  for (bool KnownSource : {false, true}) {
-    const Path File = testPath(KnownSource ? "oversized.cpp" : "oversized.dat");
-    MockFS FS;
-    FS.Files[File] = std::string(MaxWorkspaceSourceFileSize + 1, 'x');
-    auto VFS = FS.view(std::nullopt);
-    EXPECT_THAT_EXPECTED(
-        workspaceSourceFiles(testRoot(), *VFS),
-        llvm::FailedWithMessage(testing::AllOf(
-            HasSubstr(File), HasSubstr("file-rename inventory limit"))));
-  }
-}
-
-TEST(FileRename, ReusesWorkspaceInventoryWithoutRecursiveRescan) {
-  MockFS FS;
-  FS.Files[testPath("main.cpp")] = "#include \"header.h\"\n";
-  FS.Files[testPath("header.h")] = "";
-  auto Base = FS.view(std::nullopt);
-  llvm::IntrusiveRefCntPtr<llvm::vfs::TracingFileSystem> Tracing =
-      new llvm::vfs::TracingFileSystem(std::move(Base));
-  WorkspaceSourceCache Cache(testRoot());
-
-  auto First = Cache.snapshot(*Tracing);
-  ASSERT_THAT_EXPECTED(First, llvm::Succeeded());
-  ASSERT_GT(Tracing->NumDirBeginCalls, 0U);
-  const size_t DirectoryReads = Tracing->NumDirBeginCalls;
-  const size_t ContentReads = Tracing->NumOpenFileForReadCalls;
-
-  auto Second = Cache.snapshot(*Tracing);
-  ASSERT_THAT_EXPECTED(Second, llvm::Succeeded());
-  EXPECT_EQ(Tracing->NumDirBeginCalls, DirectoryReads);
-  EXPECT_EQ(Tracing->NumOpenFileForReadCalls, ContentReads);
-  EXPECT_EQ(Second->Digests.size(), First->Digests.size());
-  for (const auto &Entry : First->Digests)
-    EXPECT_EQ(Second->Digests.lookup(Entry.first()), Entry.getValue());
-}
-
-TEST(FileRename, RefreshesInvalidatedSameMetadataAndNestedFiles) {
-  MockFS FS;
-  const Path Header = testPath("header.h");
-  const Path Nested = testPath("generated/nested.inc");
-  FS.Files[Header] = "#include \"a.h\"\n";
-  FS.Timestamps[Header] = 1;
-  WorkspaceSourceCache Cache(testRoot());
-  auto View = FS.view(std::nullopt);
-  auto First = Cache.snapshot(*View);
-  ASSERT_THAT_EXPECTED(First, llvm::Succeeded());
-  FileDigest FirstDigest = First->Digests.lookup(Header);
-
-  // Identity, timestamp, and size are unchanged. The watched-file
-  // invalidation is what makes this replacement observable without rereading
-  // every cached file.
-  FS.Files[Header] = "#include \"b.h\"\n";
-  Cache.invalidate(Header);
-  View = FS.view(std::nullopt);
-  auto Changed = Cache.snapshot(*View);
-  ASSERT_THAT_EXPECTED(Changed, llvm::Succeeded());
-  EXPECT_NE(Changed->Digests.lookup(Header), FirstDigest);
-
-  FS.Files[Nested] = "#include \"b.h\"\n";
-  Cache.invalidate(Nested);
-  View = FS.view(std::nullopt);
-  auto Created = Cache.snapshot(*View);
-  ASSERT_THAT_EXPECTED(Created, llvm::Succeeded());
-  EXPECT_TRUE(Created->Digests.contains(Nested));
-  EXPECT_THAT(Created->Sources,
-              Contains(testing::Field(&WorkspaceSourceFile::File, Nested)));
-
-  FS.Files.erase(Nested);
-  Cache.invalidate(Nested);
-  View = FS.view(std::nullopt);
-  auto Deleted = Cache.snapshot(*View);
-  ASSERT_THAT_EXPECTED(Deleted, llvm::Succeeded());
-  EXPECT_FALSE(Deleted->Digests.contains(Nested));
 }
 
 TEST(FileRename, DetectsConditionalIncludeDirectives) {

@@ -16,6 +16,7 @@
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ScopedPrinter.h"
+#include "llvm/Testing/Support/Error.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #ifdef LLVM_ON_UNIX
@@ -107,6 +108,8 @@ Object:
 ...
 --- !Cmd
 Directory:       'testdir'
+HadResponseFile: false
+HadConfigFile:   false
 CommandLine:
   - 'cmd1'
   - 'cmd2'
@@ -292,53 +295,6 @@ TEST(SerializationTest, SrcsTest) {
   }
 }
 
-TEST(SerializationTest, ContextSourcesRoundTripAndRejectsUnknownSchema) {
-  auto In = readIndexFile(YAML);
-  ASSERT_TRUE(bool(In)) << In.takeError();
-
-  IncludeGraph Context;
-  IncludeGraphNode Main;
-  Main.URI = "file:///workspace/main.cpp";
-  Main.Digest = digest("main");
-  Main.DirectIncludes = {"file:///workspace/common.h"};
-  Main.Flags |= IncludeGraphNode::SourceFlag::IsTU;
-  Context[Main.URI] = Main;
-  IncludeGraphNode Header;
-  Header.URI = "file:///workspace/common.h";
-  Header.Digest = digest("header");
-  Header.Flags |= IncludeGraphNode::SourceFlag::HasConditionalIncludes;
-  Context[Header.URI] = Header;
-
-  IndexFileOut Out(*In);
-  Out.Format = IndexFileFormat::RIFF;
-  Out.ContextSources = &Context;
-  std::string Serialized = llvm::to_string(Out);
-  auto RoundTrip = readIndexFile(Serialized);
-  ASSERT_TRUE(bool(RoundTrip)) << RoundTrip.takeError();
-  ASSERT_TRUE(RoundTrip->ContextSources);
-  EXPECT_THAT(RoundTrip->ContextSources->keys(),
-              UnorderedElementsAre(Main.URI, Header.URI));
-  EXPECT_THAT(RoundTrip->ContextSources->lookup(Main.URI).DirectIncludes,
-              ElementsAre(Header.URI));
-  EXPECT_TRUE(RoundTrip->ContextSources->lookup(Header.URI).Flags &
-              IncludeGraphNode::SourceFlag::HasConditionalIncludes);
-
-  auto Parsed = riff::readFile(Serialized);
-  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
-  auto ContextChunk = llvm::find_if(Parsed->Chunks, [](riff::Chunk C) {
-    return C.ID == riff::fourCC("ctxs");
-  });
-  ASSERT_NE(ContextChunk, Parsed->Chunks.end());
-  ASSERT_GE(ContextChunk->Data.size(), 4U);
-  std::string UnknownSchema = ContextChunk->Data.str();
-  UnknownSchema[0] = 2;
-  ContextChunk->Data = UnknownSchema;
-  auto Rejected = readIndexFile(llvm::to_string(*Parsed));
-  ASSERT_FALSE(bool(Rejected));
-  EXPECT_THAT(llvm::toString(Rejected.takeError()),
-              testing::HasSubstr("context include graph schema"));
-}
-
 TEST(SerializationTest, CmdlTest) {
   auto In = readIndexFile(YAML);
   EXPECT_TRUE(bool(In)) << In.takeError();
@@ -350,11 +306,14 @@ TEST(SerializationTest, CmdlTest) {
   Cmd.Filename = "ignored";
   Cmd.Heuristic = "ignored";
   Cmd.Output = "ignored";
+  Cmd.HadResponseFile = true;
+  Cmd.HadConfigFile = true;
 
-  IndexFileOut Out(*In);
-  Out.Format = IndexFileFormat::RIFF;
-  Out.Cmd = &Cmd;
-  {
+  for (IndexFileFormat Format :
+       {IndexFileFormat::RIFF, IndexFileFormat::YAML}) {
+    IndexFileOut Out(*In);
+    Out.Format = Format;
+    Out.Cmd = &Cmd;
     std::string Serialized = llvm::to_string(Out);
 
     auto In = readIndexFile(Serialized);
@@ -364,10 +323,51 @@ TEST(SerializationTest, CmdlTest) {
     const tooling::CompileCommand &SerializedCmd = *In->Cmd;
     EXPECT_EQ(SerializedCmd.CommandLine, Cmd.CommandLine);
     EXPECT_EQ(SerializedCmd.Directory, Cmd.Directory);
+    EXPECT_EQ(SerializedCmd.HadResponseFile, Cmd.HadResponseFile);
+    EXPECT_EQ(SerializedCmd.HadConfigFile, Cmd.HadConfigFile);
     EXPECT_NE(SerializedCmd.Filename, Cmd.Filename);
     EXPECT_NE(SerializedCmd.Heuristic, Cmd.Heuristic);
     EXPECT_NE(SerializedCmd.Output, Cmd.Output);
   }
+
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  Out.Cmd = &Cmd;
+  std::string Serialized = llvm::to_string(Out);
+  auto Parsed = riff::readFile(Serialized);
+  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
+  auto Cmdl = llvm::find_if(Parsed->Chunks, [](riff::Chunk C) {
+    return C.ID == riff::fourCC("cmdl");
+  });
+  ASSERT_NE(Cmdl, Parsed->Chunks.end());
+  const std::string OriginalCmdl(Cmdl->Data);
+  size_t MarkerOffset = 0;
+  while (MarkerOffset < Cmdl->Data.size() &&
+         (static_cast<unsigned char>(Cmdl->Data[MarkerOffset++]) & 0x80))
+    ;
+  ASSERT_LT(MarkerOffset + 1, Cmdl->Data.size());
+
+  for (bool TrailingByte : {false, true}) {
+    std::string Corrupt(OriginalCmdl);
+    if (TrailingByte)
+      Corrupt.push_back('\0');
+    else
+      Corrupt[MarkerOffset] = 2;
+    Cmdl->Data = Corrupt;
+    auto Result = readIndexFile(llvm::to_string(*Parsed));
+    EXPECT_THAT_EXPECTED(
+        std::move(Result),
+        llvm::FailedWithMessage("malformed or truncated commandline section"));
+  }
+}
+
+TEST(SerializationTest, RejectsCommandWithoutProvenance) {
+  EXPECT_THAT_EXPECTED(readIndexFile(R"yaml(--- !Cmd
+Directory: testdir
+CommandLine: [clang, file.cc]
+...
+)yaml"),
+                       llvm::Failed());
 }
 
 // rlimit is part of POSIX. RLIMIT_AS does not exist in OpenBSD.

@@ -93,6 +93,10 @@ struct IncludeGraphNode {
     // preprocessor conditional. This is set only in persisted exact-context
     // graphs after a successful scan.
     HasConditionalIncludes = 1 << 2,
+    // The file was injected by the compiler command (for example -include or
+    // -imacros), rather than by a directive in a file. This is meaningful in
+    // an exact translation-unit context.
+    IsCommandInput = 1 << 3,
   };
 
   SourceFlag Flags = SourceFlag::None;

@@ -578,6 +578,29 @@ TEST(CompilerInvocation, SplitSwarfSingleCrash) {
   EXPECT_TRUE(CI); // no-crash
 }
 
+TEST(CompilerInvocation, RecordsLoadedConfigFile) {
+  auto FS = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
+  ASSERT_FALSE(FS->setCurrentWorkingDirectory("/"));
+  ASSERT_TRUE(
+      FS->addFile("/config.cfg", 0,
+                  llvm::MemoryBuffer::getMemBuffer("-DLOADED_FROM_CONFIG\n")));
+
+  bool HadConfigFile = true;
+  CreateInvocationOptions Options;
+  Options.VFS = FS;
+  Options.HadConfigFile = &HadConfigFile;
+  const char *WithoutConfig[] = {"/bin/clang", "--no-default-config",
+                                 "main.cc"};
+  EXPECT_TRUE(createInvocation(WithoutConfig, Options));
+  EXPECT_FALSE(HadConfigFile);
+
+  HadConfigFile = false;
+  const char *WithConfig[] = {"/bin/clang", "--no-default-config",
+                              "--config=/config.cfg", "main.cc"};
+  EXPECT_TRUE(createInvocation(WithConfig, Options));
+  EXPECT_TRUE(HadConfigFile);
+}
+
 TEST(ToolChainTest, UEFICallingConventionTest) {
   clang::CompilerInstance compiler;
   compiler.setVirtualFileSystem(llvm::vfs::getRealFileSystem());

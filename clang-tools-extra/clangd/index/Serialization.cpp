@@ -16,7 +16,9 @@
 #include "support/Logger.h"
 #include "support/Trace.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/Endian.h"
@@ -423,21 +425,27 @@ Relation readRelation(Reader &Data) {
 struct InternedCompileCommand {
   llvm::StringRef Directory;
   std::vector<llvm::StringRef> CommandLine;
+  uint8_t HadResponseFile = 0;
+  uint8_t HadConfigFile = 0;
 };
 
 void writeCompileCommand(const InternedCompileCommand &Cmd,
                          const StringTableOut &Strings,
                          llvm::raw_ostream &CmdOS) {
   writeVar(Strings.index(Cmd.Directory), CmdOS);
+  CmdOS.write(Cmd.HadResponseFile);
+  CmdOS.write(Cmd.HadConfigFile);
   writeVar(Cmd.CommandLine.size(), CmdOS);
   for (llvm::StringRef C : Cmd.CommandLine)
     writeVar(Strings.index(C), CmdOS);
 }
 
 InternedCompileCommand
-readCompileCommand(Reader CmdReader, llvm::ArrayRef<llvm::StringRef> Strings) {
+readCompileCommand(Reader &CmdReader, llvm::ArrayRef<llvm::StringRef> Strings) {
   InternedCompileCommand Cmd;
   Cmd.Directory = CmdReader.consumeString(Strings);
+  Cmd.HadResponseFile = CmdReader.consume8();
+  Cmd.HadConfigFile = CmdReader.consume8();
   if (!CmdReader.consumeSize(Cmd.CommandLine))
     return Cmd;
   for (llvm::StringRef &C : Cmd.CommandLine)
@@ -457,7 +465,7 @@ readCompileCommand(Reader CmdReader, llvm::ArrayRef<llvm::StringRef> Strings) {
 // The current versioning scheme is simple - non-current versions are rejected.
 // If you make a breaking change, bump this version number to invalidate stored
 // data. Later we may want to support some backward compatibility.
-constexpr static uint32_t Version = 20;
+constexpr static uint32_t Version = 21;
 
 llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
                                      SymbolOrigin Origin) {
@@ -493,13 +501,9 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     Result.Sources.emplace();
     while (!SrcsReader.eof()) {
       auto IGN = readIncludeGraphNode(SrcsReader, Strings->Strings);
-      auto Entry = Result.Sources->try_emplace(IGN.URI).first;
-      Entry->getValue() = std::move(IGN);
-      // We change all the strings inside the structure to point at the keys in
-      // the map, since it is the only copy of the string that's going to live.
-      Entry->getValue().URI = Entry->getKey();
-      for (auto &Include : Entry->getValue().DirectIncludes)
-        Include = Result.Sources->try_emplace(Include).first->getKey();
+      if (auto Err =
+              addSerializedIncludeGraphNode(*Result.Sources, std::move(IGN)))
+        return std::move(Err);
     }
     if (SrcsReader.err())
       return error("malformed or truncated include uri");
@@ -514,14 +518,15 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     Result.ContextSources.emplace();
     while (!ContextReader.eof()) {
       auto IGN = readIncludeGraphNode(ContextReader, Strings->Strings);
-      auto Entry = Result.ContextSources->try_emplace(IGN.URI).first;
-      Entry->getValue() = std::move(IGN);
-      Entry->getValue().URI = Entry->getKey();
-      for (auto &Include : Entry->getValue().DirectIncludes)
-        Include = Result.ContextSources->try_emplace(Include).first->getKey();
+      if (auto Err = addSerializedIncludeGraphNode(*Result.ContextSources,
+                                                   std::move(IGN),
+                                                   /*ExactContext=*/true))
+        return std::move(Err);
     }
     if (ContextReader.err())
       return error("malformed or truncated context include graph");
+    if (auto Err = validateContextIncludeGraph(*Result.ContextSources))
+      return std::move(Err);
   }
 
   if (Chunks.count("symb")) {
@@ -558,13 +563,26 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     Reader CmdReader(Chunks.lookup("cmdl"));
     InternedCompileCommand Cmd =
         readCompileCommand(CmdReader, Strings->Strings);
-    if (CmdReader.err())
+    if (CmdReader.err() || !CmdReader.eof() || Cmd.HadResponseFile > 1 ||
+        Cmd.HadConfigFile > 1)
       return error("malformed or truncated commandline section");
     Result.Cmd.emplace();
     Result.Cmd->Directory = std::string(Cmd.Directory);
+    Result.Cmd->HadResponseFile = Cmd.HadResponseFile;
+    Result.Cmd->HadConfigFile = Cmd.HadConfigFile;
     Result.Cmd->CommandLine.reserve(Cmd.CommandLine.size());
     for (llvm::StringRef C : Cmd.CommandLine)
       Result.Cmd->CommandLine.emplace_back(C);
+  }
+  if (Chunks.count("cc1c")) {
+    Reader CC1Reader(Chunks.lookup("cc1c"));
+    Result.CC1CommandLine.emplace();
+    if (!CC1Reader.consumeSize(*Result.CC1CommandLine))
+      return error("malformed driver-derived command section");
+    for (std::string &Arg : *Result.CC1CommandLine)
+      Arg = CC1Reader.consumeString(Strings->Strings).str();
+    if (CC1Reader.err() || !CC1Reader.eof())
+      return error("malformed driver-derived command section");
   }
   return std::move(Result);
 }
@@ -595,20 +613,20 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
     visitStrings(Symbols.back(),
                  [&](llvm::StringRef &S) { Strings.intern(S); });
   }
+  auto InternGraph = [&](const IncludeGraph *Graph,
+                         std::vector<IncludeGraphNode> &Result) {
+    if (!Graph)
+      return;
+    for (const auto &Source : *Graph) {
+      Result.push_back(Source.getValue());
+      visitStrings(Result.back(),
+                   [&](llvm::StringRef &S) { Strings.intern(S); });
+    }
+  };
   std::vector<IncludeGraphNode> Sources;
-  if (Data.Sources)
-    for (const auto &Source : *Data.Sources) {
-      Sources.push_back(Source.getValue());
-      visitStrings(Sources.back(),
-                   [&](llvm::StringRef &S) { Strings.intern(S); });
-    }
   std::vector<IncludeGraphNode> ContextSources;
-  if (Data.ContextSources)
-    for (const auto &Source : *Data.ContextSources) {
-      ContextSources.push_back(Source.getValue());
-      visitStrings(ContextSources.back(),
-                   [&](llvm::StringRef &S) { Strings.intern(S); });
-    }
+  InternGraph(Data.Sources, Sources);
+  InternGraph(Data.ContextSources, ContextSources);
 
   std::vector<std::pair<SymbolID, std::vector<Ref>>> Refs;
   if (Data.Refs) {
@@ -634,10 +652,20 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
   if (Data.Cmd) {
     InternedCmd.CommandLine.reserve(Data.Cmd->CommandLine.size());
     InternedCmd.Directory = Data.Cmd->Directory;
+    InternedCmd.HadResponseFile = Data.Cmd->HadResponseFile;
+    InternedCmd.HadConfigFile = Data.Cmd->HadConfigFile;
     Strings.intern(InternedCmd.Directory);
     for (llvm::StringRef C : Data.Cmd->CommandLine) {
       InternedCmd.CommandLine.emplace_back(C);
       Strings.intern(InternedCmd.CommandLine.back());
+    }
+  }
+  std::vector<llvm::StringRef> InternedCC1Command;
+  if (Data.CC1CommandLine) {
+    InternedCC1Command.reserve(Data.CC1CommandLine->size());
+    for (llvm::StringRef Arg : *Data.CC1CommandLine) {
+      InternedCC1Command.push_back(Arg);
+      Strings.intern(InternedCC1Command.back());
     }
   }
 
@@ -676,24 +704,28 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
     RIFF.Chunks.push_back({riff::fourCC("rela"), RelationSection});
   }
 
-  std::string SrcsSection;
-  {
-    llvm::raw_string_ostream SrcsOS(SrcsSection);
-    for (const auto &SF : Sources)
-      writeIncludeGraphNode(SF, Strings, SrcsOS);
-  }
-  RIFF.Chunks.push_back({riff::fourCC("srcs"), SrcsSection});
-
+  auto AddGraphSection =
+      [&](riff::FourCC ID, llvm::ArrayRef<IncludeGraphNode> Graph, bool Present,
+          bool ExactContext, std::string &Section) {
+        if (!Present)
+          return;
+        {
+          llvm::raw_string_ostream GraphOS(Section);
+          if (ExactContext)
+            write32(/*ContextSchema=*/1, GraphOS);
+          for (const IncludeGraphNode &Source : Graph)
+            writeIncludeGraphNode(Source, Strings, GraphOS);
+        }
+        RIFF.Chunks.push_back({ID, Section});
+      };
+  // RIFF chunks are StringRefs, so their backing storage must outlive RIFF.
+  std::string SourceSection;
   std::string ContextSection;
-  if (Data.ContextSources) {
-    {
-      llvm::raw_string_ostream ContextOS(ContextSection);
-      write32(/*ContextSchema=*/1, ContextOS);
-      for (const auto &Source : ContextSources)
-        writeIncludeGraphNode(Source, Strings, ContextOS);
-    }
-    RIFF.Chunks.push_back({riff::fourCC("ctxs"), ContextSection});
-  }
+  // srcs has historically been emitted even for an empty graph.
+  AddGraphSection(riff::fourCC("srcs"), Sources, /*Present=*/true,
+                  /*ExactContext=*/false, SourceSection);
+  AddGraphSection(riff::fourCC("ctxs"), ContextSources, Data.ContextSources,
+                  /*ExactContext=*/true, ContextSection);
 
   std::string CmdlSection;
   if (Data.Cmd) {
@@ -704,10 +736,103 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
     RIFF.Chunks.push_back({riff::fourCC("cmdl"), CmdlSection});
   }
 
+  std::string CC1Section;
+  if (Data.CC1CommandLine) {
+    {
+      llvm::raw_string_ostream CC1OS(CC1Section);
+      writeVar(InternedCC1Command.size(), CC1OS);
+      for (llvm::StringRef Arg : InternedCC1Command)
+        writeVar(Strings.index(Arg), CC1OS);
+    }
+    RIFF.Chunks.push_back({riff::fourCC("cc1c"), CC1Section});
+  }
+
   OS << RIFF;
 }
 
 } // namespace
+
+llvm::Error addSerializedIncludeGraphNode(IncludeGraph &Graph,
+                                          IncludeGraphNode Node,
+                                          bool ExactContext) {
+  if (Node.URI.empty() && !ExactContext)
+    return llvm::Error::success();
+  if (Node.URI.empty())
+    return error("include graph contains an empty URI");
+  auto Entry = Graph.try_emplace(Node.URI).first;
+  if (!Entry->getValue().URI.empty())
+    return error("include graph contains duplicate node {0}", Node.URI);
+  Entry->getValue() = std::move(Node);
+  Entry->getValue().URI = Entry->getKey();
+  for (llvm::StringRef &Include : Entry->getValue().DirectIncludes)
+    Include = Graph.try_emplace(Include).first->getKey();
+  return llvm::Error::success();
+}
+
+llvm::Error validateContextIncludeGraph(const IncludeGraph &Graph,
+                                        llvm::StringRef ExpectedMainURI,
+                                        const FileDigest *ExpectedMainDigest) {
+  constexpr uint8_t KnownFlags =
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::IsTU) |
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::HadErrors) |
+      static_cast<uint8_t>(
+          IncludeGraphNode::SourceFlag::HasConditionalIncludes) |
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::IsCommandInput);
+  llvm::StringRef MainURI;
+  const FileDigest EmptyDigest{{0}};
+  for (const auto &Entry : Graph) {
+    const IncludeGraphNode &Node = Entry.getValue();
+    if (Node.URI.empty() || Node.URI != Entry.getKey())
+      return error("context include graph has undefined node {0}",
+                   Entry.getKey());
+    if (static_cast<uint8_t>(Node.Flags) & ~KnownFlags)
+      return error("context include graph has unknown flags for {0}", Node.URI);
+    if (Node.Digest == EmptyDigest)
+      return error("context include graph has an invalid digest for {0}",
+                   Node.URI);
+    if (Node.Flags & IncludeGraphNode::SourceFlag::IsTU) {
+      if (!MainURI.empty())
+        return error("context include graph has multiple translation units");
+      MainURI = Node.URI;
+      if (Node.Flags & IncludeGraphNode::SourceFlag::IsCommandInput)
+        return error("context translation unit is marked as a command input");
+    }
+    for (llvm::StringRef Include : Node.DirectIncludes) {
+      auto Target = Graph.find(Include);
+      if (Target == Graph.end() || Target->getValue().URI.empty())
+        return error("context include graph edge from {0} is undefined: {1}",
+                     Node.URI, Include);
+    }
+  }
+  if (MainURI.empty())
+    return error("context include graph has no translation unit");
+  if (!ExpectedMainURI.empty() && MainURI != ExpectedMainURI)
+    return error("context include graph translation unit is {0}, expected {1}",
+                 MainURI, ExpectedMainURI);
+  if (ExpectedMainDigest && Graph.lookup(MainURI).Digest != *ExpectedMainDigest)
+    return error("context include graph has inconsistent main-file digest");
+
+  llvm::StringSet<> Reachable;
+  llvm::SmallVector<llvm::StringRef> Pending;
+  auto Add = [&](llvm::StringRef URI) {
+    if (Reachable.insert(URI).second)
+      Pending.push_back(URI);
+  };
+  Add(MainURI);
+  for (const auto &Entry : Graph)
+    if (Entry.getValue().Flags & IncludeGraphNode::SourceFlag::IsCommandInput)
+      Add(Entry.getKey());
+  while (!Pending.empty()) {
+    llvm::StringRef URI = Pending.pop_back_val();
+    for (llvm::StringRef Include : Graph.lookup(URI).DirectIncludes)
+      Add(Include);
+  }
+  for (const auto &Entry : Graph)
+    if (!Reachable.contains(Entry.getKey()))
+      return error("context include graph contains unreachable node {0}",
+                   Entry.getKey());
+  return llvm::Error::success();
+}
 
 // Defined in YAMLSerialization.cpp.
 void writeYAML(const IndexFileOut &, llvm::raw_ostream &);

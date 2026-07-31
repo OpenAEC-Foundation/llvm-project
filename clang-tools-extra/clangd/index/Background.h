@@ -157,6 +157,7 @@ public:
     std::vector<IndexedFile> Files;
     std::vector<Path> TranslationUnits;
     llvm::StringMap<tooling::CompileCommand> Commands;
+    llvm::StringMap<std::vector<std::string>> CC1Commands;
   };
 
   struct Options {
@@ -264,6 +265,7 @@ private:
   mutable std::mutex ShardVersionsMu;
   std::vector<IndexedFile> IndexedFiles;
   llvm::StringMap<tooling::CompileCommand> IndexedCommands;
+  llvm::StringMap<std::vector<std::string>> IndexedCC1Commands;
   std::vector<IncludeGraphError> IncludeGraphErrors;
   llvm::StringSet<> KnownTUs;
   llvm::StringSet<> FreshlyIndexedTUs;

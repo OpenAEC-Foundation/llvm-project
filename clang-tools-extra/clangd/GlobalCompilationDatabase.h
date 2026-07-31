@@ -27,6 +27,11 @@
 namespace clang {
 namespace clangd {
 
+struct FileRenameCompileCommand {
+  Path File;
+  tooling::CompileCommand Command;
+};
+
 struct ProjectInfo {
   // The directory in which the compilation database was discovered.
   // Empty if directory-based compilation database discovery was not used.
@@ -70,6 +75,12 @@ public:
   /// Database implementations backed by files on disk do not need to retain
   /// any state here. Wrappers that associate commands with paths should
   /// override this.
+  virtual llvm::Error prepareFileRenames(
+      llvm::ArrayRef<std::pair<Path, Path>> Renames,
+      llvm::ArrayRef<FileRenameCompileCommand> ValidatedCommands) const;
+
+  virtual void discardPreparedFileRenames() const {}
+
   virtual llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
     return llvm::Error::success();
@@ -109,11 +120,19 @@ public:
 
   bool blockUntilIdle(Deadline D) const override;
 
+  llvm::Error prepareFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
+                                 llvm::ArrayRef<FileRenameCompileCommand>
+                                     ValidatedCommands) const override;
+
+  void discardPreparedFileRenames() const override;
+
   llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const override;
 
-private:
+protected:
   const GlobalCompilationDatabase *Base;
+
+private:
   std::unique_ptr<GlobalCompilationDatabase> BaseOwner;
   CommandChanged::Subscription BaseChanged;
 };
@@ -227,6 +246,7 @@ public:
       std::vector<std::string> FallbackFlags = {},
       CommandMangler Mangler = nullptr,
       std::optional<std::string> FallbackWorkingDirectory = std::nullopt);
+  ~OverlayCDB() override;
 
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
@@ -239,6 +259,12 @@ public:
   setCompileCommand(PathRef File,
                     std::optional<tooling::CompileCommand> CompilationCommand);
 
+  llvm::Error prepareFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
+                                 llvm::ArrayRef<FileRenameCompileCommand>
+                                     ValidatedCommands) const override;
+
+  void discardPreparedFileRenames() const override;
+
   llvm::Error
   filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const override;
 
@@ -249,6 +275,13 @@ private:
   mutable std::mutex Mutex;
   mutable llvm::StringMap<tooling::CompileCommand>
       Commands; /* GUARDED_BY(Mutex) */
+  struct PreparedRename;
+  llvm::Expected<std::unique_ptr<PreparedRename>> buildRenamePlanLocked(
+      llvm::ArrayRef<std::pair<Path, Path>> Renames,
+      const llvm::StringMap<tooling::CompileCommand> *ValidatedCommands) const;
+  static void expandResponseFileProvenance(tooling::CompileCommand &Command);
+  mutable std::unique_ptr<PreparedRename> Prepared;
+  mutable uint64_t CommandGeneration = 0;
   CommandMangler Mangler;
   std::vector<std::string> FallbackFlags;
 };

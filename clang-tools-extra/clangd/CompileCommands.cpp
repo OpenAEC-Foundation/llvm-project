@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CompileCommands.h"
+#include "CompilerInvocation.h"
 #include "Config.h"
 #include "support/Logger.h"
 #include "support/Trace.h"
@@ -233,8 +234,8 @@ void CommandMangler::operator()(tooling::CompileCommand &Command,
   OriginalArgs.reserve(Cmd.size());
   for (const auto &S : Cmd)
     OriginalArgs.push_back(S.c_str());
-  bool IsCLMode = driver::IsClangCL(driver::getDriverMode(
-      OriginalArgs[0], llvm::ArrayRef(OriginalArgs).slice(1)));
+  bool IsCLMode =
+      compilerInvocationMode(Cmd) == CompilerInvocationMode::ClangCL;
   // ParseArgs propagates missing arg/opt counts on error, but preserves
   // everything it could parse in ArgList. So we just ignore those counts.
   unsigned IgnoredCount;

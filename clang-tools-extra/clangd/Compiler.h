@@ -76,7 +76,8 @@ void disableUnsupportedOptions(CompilerInvocation &CI);
 /// Builds compiler invocation that could be used to build AST or preamble.
 std::unique_ptr<CompilerInvocation>
 buildCompilerInvocation(const ParseInputs &Inputs, clang::DiagnosticConsumer &D,
-                        std::vector<std::string> *CC1Args = nullptr);
+                        std::vector<std::string> *CC1Args = nullptr,
+                        bool *HadConfigFile = nullptr);
 
 /// Creates a compiler instance, configured so that:
 ///   - Contents of the parsed file are remapped to \p MainFile.

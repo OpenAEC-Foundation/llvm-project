@@ -59,6 +59,8 @@ createInvocation(ArrayRef<const char *> ArgList, CreateInvocationOptions Opts) {
   TheDriver.setProbePrecompiled(Opts.ProbePrecompiled);
 
   std::unique_ptr<driver::Compilation> C(TheDriver.BuildCompilation(Args));
+  if (Opts.HadConfigFile)
+    *Opts.HadConfigFile = !TheDriver.getConfigFiles().empty();
   if (!C)
     return nullptr;
 

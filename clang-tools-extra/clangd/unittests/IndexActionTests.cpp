@@ -35,6 +35,10 @@ std::string toUri(llvm::StringRef Path) { return URI::create(Path).toString(); }
 
 MATCHER(isTU, "") { return arg.Flags & IncludeGraphNode::SourceFlag::IsTU; }
 
+MATCHER(isCommandInput, "") {
+  return arg.Flags & IncludeGraphNode::SourceFlag::IsCommandInput;
+}
+
 MATCHER_P(hasDigest, Digest, "") { return arg.Digest == Digest; }
 
 MATCHER_P(hasName, Name, "") { return arg.Name == Name; }
@@ -145,6 +149,33 @@ TEST_F(IndexActionTest, CollectIncludeGraph) {
                   Pair(toUri(Level2HeaderPath),
                        AllOf(Not(isTU()), includesAre({}),
                              hasDigest(digest(Level2HeaderCode))))));
+}
+
+TEST_F(IndexActionTest, IncludeGraphRecordsCommandLineIncludes) {
+  std::string MainFilePath = testPath("main.cpp");
+  std::string ForcedHeaderPath = testPath("forced.h");
+  std::string MacrosHeaderPath = testPath("macros.h");
+
+  addFile(MainFilePath, "int main();");
+  addFile(ForcedHeaderPath, "struct Forced {};");
+  addFile(MacrosHeaderPath, "#define FROM_MACROS 1");
+
+  IndexFileIn IndexFile =
+      runIndexingAction(MainFilePath, {"-include", ForcedHeaderPath, "-imacros",
+                                       MacrosHeaderPath});
+  auto Nodes = toMap(*IndexFile.Sources);
+
+  EXPECT_THAT(
+      Nodes,
+      UnorderedElementsAre(
+          Pair(toUri(MainFilePath), AllOf(isTU(), includesAre({}),
+                                          hasDigest(digest("int main();")))),
+          Pair(toUri(ForcedHeaderPath),
+               AllOf(Not(isTU()), isCommandInput(), includesAre({}),
+                     hasDigest(digest("struct Forced {};")))),
+          Pair(toUri(MacrosHeaderPath),
+               AllOf(Not(isTU()), isCommandInput(), includesAre({}),
+                     hasDigest(digest("#define FROM_MACROS 1"))))));
 }
 
 TEST_F(IndexActionTest, IncludeGraphSelfInclude) {

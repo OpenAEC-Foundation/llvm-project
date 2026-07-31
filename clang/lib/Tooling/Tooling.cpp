@@ -303,7 +303,7 @@ void addTargetAndModeForProgramName(std::vector<std::string> &CommandLine,
   }
 }
 
-void addExpandedResponseFiles(std::vector<std::string> &CommandLine,
+bool addExpandedResponseFiles(std::vector<std::string> &CommandLine,
                               llvm::StringRef WorkingDir,
                               llvm::cl::TokenizerCallback Tokenizer,
                               llvm::vfs::FileSystem &FS) {
@@ -316,7 +316,7 @@ void addExpandedResponseFiles(std::vector<std::string> &CommandLine,
       SeenRSPFile |= Arg.front() == '@';
   }
   if (!SeenRSPFile)
-    return;
+    return false;
   llvm::BumpPtrAllocator Alloc;
   llvm::cl::ExpansionContext ECtx(Alloc, Tokenizer);
   llvm::Error Err =
@@ -326,6 +326,7 @@ void addExpandedResponseFiles(std::vector<std::string> &CommandLine,
   // Don't assign directly, Argv aliases CommandLine.
   std::vector<std::string> ExpandedArgv(Argv.begin(), Argv.end());
   CommandLine = std::move(ExpandedArgv);
+  return true;
 }
 
 } // namespace tooling

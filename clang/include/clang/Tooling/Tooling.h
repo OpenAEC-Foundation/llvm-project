@@ -511,8 +511,12 @@ llvm::Expected<std::string> getAbsolutePath(llvm::vfs::FileSystem &FS,
 void addTargetAndModeForProgramName(std::vector<std::string> &CommandLine,
                                     StringRef InvokedAs);
 
-/// Helper function that expands response files in command line.
-void addExpandedResponseFiles(std::vector<std::string> &CommandLine,
+/// Expands response files in CommandLine.
+///
+/// Returns true whenever an @file argument was observed, even if reading or
+/// expanding that response file failed. This reports indirection provenance,
+/// not successful expansion.
+bool addExpandedResponseFiles(std::vector<std::string> &CommandLine,
                               llvm::StringRef WorkingDir,
                               llvm::cl::TokenizerCallback Tokenizer,
                               llvm::vfs::FileSystem &FS);

@@ -198,6 +198,7 @@ FileShardedIndex::getShard(llvm::StringRef Uri) const {
   IndexFileIn IF;
   IF.Sources = It->getValue().IG;
   IF.Cmd = Index.Cmd;
+  IF.CC1CommandLine = Index.CC1CommandLine;
 
   SymbolSlab::Builder SymB;
   for (const auto *S : It->getValue().Symbols)

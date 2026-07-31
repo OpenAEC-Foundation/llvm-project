@@ -46,8 +46,8 @@ public:
 private:
   std::vector<CompileCommand> expand(std::vector<CompileCommand> Cmds) const {
     for (auto &Cmd : Cmds)
-      tooling::addExpandedResponseFiles(Cmd.CommandLine, Cmd.Directory,
-                                        Tokenizer, *FS);
+      Cmd.HadResponseFile |= tooling::addExpandedResponseFiles(
+          Cmd.CommandLine, Cmd.Directory, Tokenizer, *FS);
     return Cmds;
   }
 

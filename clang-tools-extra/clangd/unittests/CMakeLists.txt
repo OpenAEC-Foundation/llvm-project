@@ -35,9 +35,12 @@ add_unittest(ClangdUnitTests ClangdTests
   ASTTests.cpp
   ASTSignalsTests.cpp
   BackgroundIndexTests.cpp
+  BackgroundFileRenameTests.cpp
+  BackgroundIncludeGraphTests.cpp
   CallHierarchyTests.cpp
   CanonicalIncludesTests.cpp
   ClangdTests.cpp
+  ClangdServerFileRenameTests.cpp
   ClangdLSPServerTests.cpp
   CodeCompleteTests.cpp
   CodeCompletionStringsTests.cpp
@@ -56,7 +59,10 @@ add_unittest(ClangdUnitTests ClangdTests
   FeatureModulesTests.cpp
   FeatureModulesRegistryTests.cpp
   FileDistanceTests.cpp
+  FileRenameCompilerOptionsTests.cpp
+  FileRenameDirectiveCacheTests.cpp
   FileRenameTests.cpp
+  WorkspaceSourceCacheTests.cpp
   FileIndexTests.cpp
   FindSymbolsTests.cpp
   FindTargetTests.cpp
@@ -91,6 +97,7 @@ add_unittest(ClangdUnitTests ClangdTests
   SemanticHighlightingTests.cpp
   SemanticSelectionTests.cpp
   SerializationTests.cpp
+  IncludeGraphSerializationTests.cpp
   SourceCodeTests.cpp
   StdLibTests.cpp
   SymbolCollectorTests.cpp

@@ -94,7 +94,8 @@ void disableUnsupportedOptions(CompilerInvocation &CI) {
 
 std::unique_ptr<CompilerInvocation>
 buildCompilerInvocation(const ParseInputs &Inputs, clang::DiagnosticConsumer &D,
-                        std::vector<std::string> *CC1Args) {
+                        std::vector<std::string> *CC1Args,
+                        bool *HadConfigFile) {
   llvm::ArrayRef<std::string> Argv = Inputs.CompileCommand.CommandLine;
   if (Argv.empty())
     return nullptr;
@@ -110,6 +111,7 @@ buildCompilerInvocation(const ParseInputs &Inputs, clang::DiagnosticConsumer &D,
   CreateInvocationOptions CIOpts;
   CIOpts.VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
   CIOpts.CC1Args = CC1Args;
+  CIOpts.HadConfigFile = HadConfigFile;
   CIOpts.RecoverOnError = true;
   DiagnosticOptions DiagOpts;
   CIOpts.Diags =

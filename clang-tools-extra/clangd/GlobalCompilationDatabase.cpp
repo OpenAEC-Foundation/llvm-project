@@ -27,7 +27,6 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
-#include "llvm/TargetParser/Host.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -774,13 +773,6 @@ DirectoryBasedGlobalCompilationDatabase::getProjectModules(PathRef File) const {
   return clang::clangd::getProjectModules(Res->CDB, Opts.TFS);
 }
 
-OverlayCDB::OverlayCDB(const GlobalCompilationDatabase *Base,
-                       std::vector<std::string> FallbackFlags,
-                       CommandMangler Mangler,
-                       std::optional<std::string> FallbackWorkingDirectory)
-    : DelegatingCDB(Base, FallbackWorkingDirectory),
-      Mangler(std::move(Mangler)), FallbackFlags(std::move(FallbackFlags)) {}
-
 std::optional<tooling::CompileCommand>
 OverlayCDB::getCompileCommand(PathRef File) const {
   std::optional<tooling::CompileCommand> Cmd;
@@ -791,20 +783,7 @@ OverlayCDB::getCompileCommand(PathRef File) const {
       Cmd = It->second;
   }
   if (Cmd) {
-    // FS used for expanding response files.
-    // FIXME: ExpandResponseFiles appears not to provide the usual
-    // thread-safety guarantees, as the access to FS is not locked!
-    // For now, use the real FS, which is known to be threadsafe (if we don't
-    // use/change working directory, which ExpandResponseFiles doesn't).
-    auto FS = llvm::vfs::getRealFileSystem();
-    auto Tokenizer = llvm::Triple(llvm::sys::getProcessTriple()).isOSWindows()
-                         ? llvm::cl::TokenizeWindowsCommandLine
-                         : llvm::cl::TokenizeGNUCommandLine;
-    // Compile command pushed via LSP protocol may have response files that need
-    // to be expanded before further processing. For CDB for files it happens in
-    // the main CDB when reading it from the JSON file.
-    tooling::addExpandedResponseFiles(Cmd->CommandLine, Cmd->Directory,
-                                      Tokenizer, *FS);
+    expandResponseFileProvenance(*Cmd);
   }
   if (!Cmd)
     Cmd = DelegatingCDB::getCompileCommand(File);
@@ -823,73 +802,6 @@ tooling::CompileCommand OverlayCDB::getFallbackCommand(PathRef File) const {
   if (Mangler)
     Mangler(Cmd, File);
   return Cmd;
-}
-
-bool OverlayCDB::setCompileCommand(PathRef File,
-                                   std::optional<tooling::CompileCommand> Cmd) {
-  // We store a canonical version internally to prevent mismatches between set
-  // and get compile commands. Also it assures clients listening to broadcasts
-  // doesn't receive different names for the same file.
-  std::string CanonPath = removeDots(File);
-  {
-    std::unique_lock<std::mutex> Lock(Mutex);
-    if (Cmd) {
-      if (auto [It, Inserted] =
-              Commands.try_emplace(CanonPath, std::move(*Cmd));
-          !Inserted) {
-        if (It->second == *Cmd)
-          return false;
-        It->second = *Cmd;
-      }
-    } else
-      Commands.erase(CanonPath);
-  }
-  OnCommandChanged.broadcast({CanonPath});
-  return true;
-}
-
-llvm::Error
-OverlayCDB::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
-  llvm::StringMap<tooling::CompileCommand> NewCommands;
-  std::lock_guard<std::mutex> Lock(Mutex);
-  for (const auto &Entry : Commands) {
-    auto NewPath = mapPathAfterRenames(Entry.first(), Renames);
-    if (!NewPath)
-      return NewPath.takeError();
-    tooling::CompileCommand Command = Entry.getValue();
-    Path OriginalFilename = Command.Filename;
-    if (!OriginalFilename.empty()) {
-      llvm::SmallString<256> AbsoluteFilename(OriginalFilename);
-      if (!llvm::sys::path::is_absolute(AbsoluteFilename)) {
-        AbsoluteFilename = Command.Directory;
-        llvm::sys::path::append(AbsoluteFilename, OriginalFilename);
-        llvm::sys::path::remove_dots(AbsoluteFilename,
-                                     /*remove_dot_dot=*/true);
-      }
-      auto NewFilename = mapPathAfterRenames(AbsoluteFilename, Renames);
-      if (!NewFilename)
-        return NewFilename.takeError();
-      if (!pathEqual(AbsoluteFilename, *NewFilename)) {
-        Command.Filename = *NewFilename;
-        for (std::string &Arg : Command.CommandLine)
-          if (Arg == OriginalFilename || Arg == AbsoluteFilename)
-            Arg = *NewFilename;
-      }
-    }
-    auto NewDirectory = mapPathAfterRenames(Command.Directory, Renames);
-    if (!NewDirectory)
-      return NewDirectory.takeError();
-    Command.Directory = std::move(*NewDirectory);
-    if (!NewCommands.try_emplace(*NewPath, std::move(Command)).second)
-      return error("file rename collides at compilation command path {0}",
-                   *NewPath);
-  }
-
-  if (auto Err = DelegatingCDB::filesRenamed(Renames))
-    return Err;
-
-  Commands = std::move(NewCommands);
-  return llvm::Error::success();
 }
 
 std::unique_ptr<ProjectModules>
@@ -953,13 +865,6 @@ bool DelegatingCDB::blockUntilIdle(Deadline D) const {
   if (!Base)
     return true;
   return Base->blockUntilIdle(D);
-}
-
-llvm::Error DelegatingCDB::filesRenamed(
-    llvm::ArrayRef<std::pair<Path, Path>> Renames) const {
-  if (!Base)
-    return llvm::Error::success();
-  return Base->filesRenamed(Renames);
 }
 
 } // namespace clangd

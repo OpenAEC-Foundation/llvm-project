@@ -97,8 +97,12 @@ public:
       return;
 
     auto IncludingURI = toURI(SM.getFileEntryRefForID(SM.getFileID(HashLoc)));
-    if (!IncludingURI)
+    if (!IncludingURI) {
+      auto NodeForInclude = IG.try_emplace(*IncludeURI).first;
+      NodeForInclude->getValue().Flags |=
+          IncludeGraphNode::SourceFlag::IsCommandInput;
       return;
+    }
 
     auto NodeForInclude = IG.try_emplace(*IncludeURI).first->getKey();
     auto NodeForIncluding = IG.try_emplace(*IncludingURI);
@@ -185,12 +189,12 @@ public:
     Result.Refs = Collector->takeRefs();
     Result.Relations = Collector->takeRelations();
 #ifndef NDEBUG
-      // This checks if all nodes are initialized.
-      for (const auto &Node : IG)
-        assert(Node.getKeyData() == Node.getValue().URI.data());
+    // This checks if all nodes are initialized.
+    for (const auto &Node : IG)
+      assert(Node.getKeyData() == Node.getValue().URI.data());
 #endif
-      Result.Sources = std::move(IG);
-      IndexContentsCallback(std::move(Result));
+    Result.Sources = std::move(IG);
+    IndexContentsCallback(std::move(Result));
   }
 
 private:

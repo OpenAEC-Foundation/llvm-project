@@ -66,10 +66,12 @@ add_clang_library(clangDaemon STATIC
   ASTSignals.cpp
   ClangdLSPServer.cpp
   ClangdServer.cpp
+  ClangdServerFileRename.cpp
   CodeComplete.cpp
   CodeCompletionStrings.cpp
   CollectMacros.cpp
   CompileCommands.cpp
+  CompilerInvocation.cpp
   Compiler.cpp
   Config.cpp
   ConfigCompile.cpp
@@ -83,6 +85,7 @@ add_clang_library(clangDaemon STATIC
   FeatureModule.cpp
   Feature.cpp
   FileRename.cpp
+  FileRenameOptions.cpp
   WorkspaceSourceCache.cpp
   FindSymbols.cpp
   FindTarget.cpp
@@ -91,6 +94,7 @@ add_clang_library(clangDaemon STATIC
   FS.cpp
   FuzzyMatch.cpp
   GlobalCompilationDatabase.cpp
+  GlobalCompilationDatabaseFileRename.cpp
   Headers.cpp
   HeaderSourceSwitch.cpp
   Hover.cpp
@@ -120,6 +124,7 @@ add_clang_library(clangDaemon STATIC
   ${COMPLETIONMODEL_SOURCES}
 
   index/Background.cpp
+  index/BackgroundFileRename.cpp
   index/BackgroundIndexLoader.cpp
   index/BackgroundIndexStorage.cpp
   index/BackgroundQueue.cpp

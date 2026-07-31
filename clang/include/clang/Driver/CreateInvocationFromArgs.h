@@ -47,6 +47,8 @@ struct CreateInvocationOptions {
   /// If set, the target is populated with the cc1 args produced by the driver.
   /// This may be populated even if createInvocation returns nullptr.
   std::vector<std::string> *CC1Args = nullptr;
+  /// If set, records whether the driver loaded any configuration file.
+  bool *HadConfigFile = nullptr;
 };
 
 /// Interpret clang arguments in preparation to parse a file.

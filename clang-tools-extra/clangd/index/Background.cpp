@@ -192,6 +192,7 @@ BackgroundIndex::includeGraphSnapshot() const {
   Result.Generation = GraphGeneration;
   Result.Files = IndexedFiles;
   Result.Commands = IndexedCommands;
+  Result.CC1Commands = IndexedCC1Commands;
   Result.TranslationUnits.reserve(KnownTUs.size());
   for (llvm::StringRef TU : KnownTUs.keys())
     Result.TranslationUnits.push_back(TU.str());
@@ -218,232 +219,6 @@ void BackgroundIndex::ensureIncludeGraph() {
     Tasks.push_back(indexFileTask(std::move(TU),
                                   /*BypassDuplicateSuppression=*/true, Epoch));
   Queue.append(std::move(Tasks));
-}
-
-llvm::Error
-BackgroundIndex::filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames) {
-  std::lock_guard<std::mutex> RenameLock(RenameMu);
-  std::vector<Path> IncompleteTUs;
-  {
-    std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-    for (PathRef TU : KnownTUs.keys())
-      if (!FreshlyIndexedTUs.contains(TU))
-        IncompleteTUs.push_back(TU.str());
-  }
-
-  // A didRename notification may arrive before queued cache loading starts.
-  // Read the persisted per-TU context directly so dependency shards moved by
-  // a directory rename are still invalidated and the owning TU is rebuilt.
-  llvm::StringSet<> CachedAffectedTUs;
-  llvm::StringSet<> CachedRemovedPaths;
-  llvm::DenseSet<BackgroundIndexStorage *> ClearedStorage;
-  for (PathRef TU : IncompleteTUs) {
-    auto NewTU = mapPathAfterRenames(TU, Renames);
-    if (!NewTU)
-      return NewTU.takeError();
-    if (TU != *NewTU) {
-      CachedAffectedTUs.insert(TU);
-      CachedRemovedPaths.insert(TU);
-    }
-    BackgroundIndexStorage *Storage = IndexStorageFactory(TU);
-    auto MainShard = Storage->loadShard(TU);
-    if (!MainShard) {
-      CachedAffectedTUs.insert(TU);
-      if (ClearedStorage.insert(Storage).second)
-        if (auto Err = Storage->clear())
-          return Err;
-      continue;
-    }
-    if (!MainShard->ContextSources) {
-      CachedAffectedTUs.insert(TU);
-      Path LegacyTU = TU.str();
-      for (const LoadedShard &Legacy :
-           loadIndexShards({LegacyTU}, IndexStorageFactory, CDB)) {
-        auto NewPath = mapPathAfterRenames(Legacy.AbsolutePath, Renames);
-        if (!NewPath)
-          return NewPath.takeError();
-        if (Legacy.AbsolutePath != *NewPath)
-          CachedRemovedPaths.insert(Legacy.AbsolutePath);
-      }
-      continue;
-    }
-    for (const auto &Source : *MainShard->ContextSources) {
-      auto SourcePath = URI::resolve(Source.first(), TU);
-      if (!SourcePath)
-        return SourcePath.takeError();
-      auto NewSource = mapPathAfterRenames(*SourcePath, Renames);
-      if (!NewSource)
-        return NewSource.takeError();
-      if (*SourcePath != *NewSource) {
-        CachedAffectedTUs.insert(TU);
-        CachedRemovedPaths.insert(*SourcePath);
-      }
-      for (llvm::StringRef IncludedURI : Source.getValue().DirectIncludes) {
-        auto Included = URI::resolve(IncludedURI, TU);
-        if (!Included)
-          return Included.takeError();
-        auto NewInclude = mapPathAfterRenames(*Included, Renames);
-        if (!NewInclude)
-          return NewInclude.takeError();
-        if (*Included != *NewInclude)
-          CachedAffectedTUs.insert(TU);
-      }
-    }
-  }
-
-  std::vector<IndexedFile> NewFiles;
-  llvm::StringMap<ShardVersion> NewVersions;
-  llvm::StringSet<> NewKnownTUs;
-  llvm::StringSet<> NewFreshTUs;
-  llvm::StringMap<std::string> NewFailures;
-  std::vector<IncludeGraphError> NewGraphErrors;
-  llvm::StringMap<tooling::CompileCommand> NewCommands;
-  llvm::StringSet<> InvalidatedFiles;
-  llvm::StringSet<> RemovedPaths;
-  llvm::StringSet<> AffectedTUs;
-  for (PathRef TU : CachedAffectedTUs.keys())
-    AffectedTUs.insert(TU);
-  for (PathRef File : CachedRemovedPaths.keys())
-    RemovedPaths.insert(File);
-  std::vector<std::string> TranslationUnits;
-  uint64_t ScheduledRenameEpoch;
-  {
-    std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-    ++RenameEpoch;
-    ScheduledRenameEpoch = RenameEpoch;
-    ++GraphGeneration;
-    PendingIncludeGraphTUs.clear();
-    for (const IndexedFile &File : IndexedFiles) {
-      auto NewFile = mapPathAfterRenames(File.File, Renames);
-      if (!NewFile)
-        return NewFile.takeError();
-      bool Affected = File.File != *NewFile;
-      for (PathRef Included : File.DirectIncludes) {
-        auto NewInclude = mapPathAfterRenames(Included, Renames);
-        if (!NewInclude)
-          return NewInclude.takeError();
-        Affected |= Included != *NewInclude;
-      }
-      if (Affected)
-        AffectedTUs.insert(File.DependentTU);
-    }
-
-    llvm::StringSet<> ContextKeys;
-    NewFiles.reserve(IndexedFiles.size());
-    for (IndexedFile File : IndexedFiles) {
-      bool Invalidated = false;
-      auto NewFile = mapPathAfterRenames(File.File, Renames);
-      if (!NewFile)
-        return NewFile.takeError();
-      Invalidated |= File.File != *NewFile;
-      Path OldFile = File.File;
-      File.File = std::move(*NewFile);
-      auto NewTU = mapPathAfterRenames(File.DependentTU, Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      File.DependentTU = std::move(*NewTU);
-      for (Path &Included : File.DirectIncludes) {
-        auto NewInclude = mapPathAfterRenames(Included, Renames);
-        if (!NewInclude)
-          return NewInclude.takeError();
-        Invalidated |= Included != *NewInclude;
-        Included = std::move(*NewInclude);
-      }
-      if (Invalidated) {
-        RemovedPaths.insert(OldFile);
-        InvalidatedFiles.insert(File.File);
-      }
-      std::string ContextKey = File.DependentTU + "\n" + File.File;
-      if (!ContextKeys.insert(ContextKey).second)
-        return error("file rename collides at indexed context {0} from {1}",
-                     File.File, File.DependentTU);
-      NewFiles.push_back(std::move(File));
-    }
-    for (const auto &Entry : ShardVersions) {
-      auto NewFile = mapPathAfterRenames(Entry.first(), Renames);
-      if (!NewFile)
-        return NewFile.takeError();
-      if (InvalidatedFiles.contains(*NewFile))
-        continue;
-      if (!NewVersions.try_emplace(*NewFile, Entry.getValue()).second)
-        return error("file rename collides at shard path {0}", *NewFile);
-    }
-    for (llvm::StringRef TU : KnownTUs.keys()) {
-      auto NewTU = mapPathAfterRenames(TU, Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      if (TU != *NewTU)
-        AffectedTUs.insert(TU);
-      if (!NewKnownTUs.insert(*NewTU).second)
-        return error("file rename collides at translation unit {0}", *NewTU);
-    }
-    for (llvm::StringRef TU : FreshlyIndexedTUs.keys()) {
-      auto NewTU = mapPathAfterRenames(TU, Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      if (!AffectedTUs.contains(TU))
-        NewFreshTUs.insert(*NewTU);
-    }
-    for (const auto &Entry : IndexFailures) {
-      auto NewTU = mapPathAfterRenames(Entry.first(), Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      if (!NewFailures.try_emplace(*NewTU, Entry.getValue()).second)
-        return error("file rename collides at failed translation unit {0}",
-                     *NewTU);
-    }
-    for (IncludeGraphError Entry : IncludeGraphErrors) {
-      auto NewPath = mapPathAfterRenames(Entry.File, Renames);
-      if (!NewPath)
-        return NewPath.takeError();
-      auto NewTU = mapPathAfterRenames(Entry.DependentTU, Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      Entry.File = std::move(*NewPath);
-      Entry.DependentTU = std::move(*NewTU);
-      NewGraphErrors.push_back(std::move(Entry));
-    }
-    for (const auto &Entry : IndexedCommands) {
-      auto NewTU = mapPathAfterRenames(Entry.first(), Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      if (!AffectedTUs.contains(Entry.first()))
-        NewCommands.try_emplace(*NewTU, Entry.getValue());
-    }
-    IndexedFiles = std::move(NewFiles);
-    IndexedCommands = std::move(NewCommands);
-    ShardVersions = std::move(NewVersions);
-    KnownTUs = std::move(NewKnownTUs);
-    FreshlyIndexedTUs = std::move(NewFreshTUs);
-    IndexFailures = std::move(NewFailures);
-    IncludeGraphErrors = std::move(NewGraphErrors);
-    for (llvm::StringRef TU : AffectedTUs.keys()) {
-      auto NewTU = mapPathAfterRenames(TU, Renames);
-      if (!NewTU)
-        return NewTU.takeError();
-      PendingIncludeGraphTUs[*NewTU] = ScheduledRenameEpoch;
-      TranslationUnits.push_back(std::move(*NewTU));
-    }
-  }
-
-  llvm::Error RemoveErrors = llvm::Error::success();
-  for (PathRef OldPath : RemovedPaths.keys()) {
-    RemoveErrors =
-        llvm::joinErrors(std::move(RemoveErrors),
-                         IndexStorageFactory(OldPath)->removeShard(OldPath));
-    IndexedSymbols.update(URI::create(OldPath).toString(),
-                          /*Symbols=*/nullptr, /*Refs=*/nullptr,
-                          /*Relations=*/nullptr, /*CountReferences=*/false);
-    Rebuilder.indexedTU();
-  }
-  std::vector<BackgroundQueue::Task> Tasks;
-  Tasks.reserve(TranslationUnits.size());
-  for (std::string &TU : TranslationUnits)
-    Tasks.push_back(indexFileTask(std::move(TU),
-                                  /*BypassDuplicateSuppression=*/true,
-                                  ScheduledRenameEpoch));
-  Queue.append(std::move(Tasks));
-  return RemoveErrors;
 }
 
 BackgroundQueue::Task
@@ -574,7 +349,10 @@ void BackgroundIndex::update(
   std::vector<IndexedFile> Contexts;
   llvm::StringMap<std::string> GraphErrors;
   assert(Index.Cmd && "background index result has no compile command");
+  assert(Index.CC1CommandLine &&
+         "background index result has no driver-derived command");
   tooling::CompileCommand Command = *Index.Cmd;
+  std::vector<std::string> CC1Command = *Index.CC1CommandLine;
   IncludeGraph ContextSources = cloneIncludeGraph(*Index.Sources);
   auto FS = TFS.view(Command.Directory);
   // Note that sources do not contain any information regarding missing headers,
@@ -629,6 +407,7 @@ void BackgroundIndex::update(
   llvm::erase_if(IndexedFiles, [&](const IndexedFile &File) {
     return File.DependentTU == MainFile;
   });
+  IndexedCC1Commands.erase(MainFile);
   IndexedFiles.insert(IndexedFiles.end(),
                       std::make_move_iterator(Contexts.begin()),
                       std::make_move_iterator(Contexts.end()));
@@ -652,8 +431,12 @@ void BackgroundIndex::update(
     // current model keeps only one version of a header file.
     if (Path != MainFile)
       IF->Cmd.reset();
-    else if (GraphErrors.empty())
+    if (Path != MainFile)
+      IF->CC1CommandLine.reset();
+    else if (GraphErrors.empty()) {
       IF->ContextSources = std::move(ContextSources);
+      IndexedCC1Commands[MainFile] = std::move(CC1Command);
+    }
 
     // We need to store shards before updating the index, since the latter
     // consumes slabs.
@@ -704,7 +487,10 @@ llvm::Error BackgroundIndex::index(tooling::CompileCommand Cmd,
   Inputs.TFS = &TFS;
   Inputs.CompileCommand = std::move(Cmd);
   IgnoreDiagnostics IgnoreDiags;
-  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
+  std::vector<std::string> CC1Args;
+  bool HadConfigFile = false;
+  auto CI =
+      buildCompilerInvocation(Inputs, IgnoreDiags, &CC1Args, &HadConfigFile);
   if (!CI)
     return error("Couldn't build compiler invocation");
 
@@ -758,6 +544,8 @@ llvm::Error BackgroundIndex::index(tooling::CompileCommand Cmd,
 
   Action->EndSourceFile();
 
+  Index.CC1CommandLine = std::move(CC1Args);
+  Inputs.CompileCommand.HadConfigFile = HadConfigFile;
   Index.Cmd = Inputs.CompileCommand;
   assert(Index.Symbols && Index.Refs && Index.Sources &&
          "Symbols, Refs and Sources must be set.");
@@ -804,6 +592,7 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles,
   size_t LoadedShards = 0;
   llvm::StringSet<> LoadedTranslationUnits;
   llvm::StringSet<> LoadedExactTranslationUnits;
+  auto FS = TFS.view(/*CWD=*/std::nullopt);
   {
     // Update in-memory state.
     std::lock_guard<std::mutex> Lock(ShardVersionsMu);
@@ -833,15 +622,51 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles,
         LoadedTranslationUnits.insert(LS.AbsolutePath);
       ++LoadedShards;
 
+      if (LS.CountReferences && LS.AbsolutePath == LS.DependentTU) {
+        llvm::erase_if(IndexedFiles, [&](const IndexedFile &File) {
+          return File.DependentTU == LS.AbsolutePath;
+        });
+        IndexedCommands.erase(LS.AbsolutePath);
+        IndexedCC1Commands.erase(LS.AbsolutePath);
+        FreshlyIndexedTUs.erase(LS.AbsolutePath);
+      }
       if (LS.CountReferences && LS.AbsolutePath == LS.DependentTU &&
-          LS.Shard->ContextSources && LS.Shard->Cmd) {
+          LS.Shard->ContextSources && LS.Shard->Cmd &&
+          LS.Shard->CC1CommandLine) {
         tooling::CompileCommand Command = *LS.Shard->Cmd;
         Command.Filename = LS.AbsolutePath;
         std::vector<IndexedFile> Contexts;
         bool Complete = true;
+        const std::string MainURI = URI::create(LS.AbsolutePath).toString();
+        if (auto Err = validateContextIncludeGraph(*LS.Shard->ContextSources,
+                                                   MainURI, &LS.Digest)) {
+          vlog("Rejecting malformed context cache for {0}: {1}",
+               LS.AbsolutePath, std::move(Err));
+          Complete = false;
+        }
+        auto MainSource = LS.Shard->Sources ? LS.Shard->Sources->find(MainURI)
+                                            : IncludeGraph::const_iterator();
+        if (!LS.Shard->Sources || MainSource == LS.Shard->Sources->end() ||
+            MainSource->getValue().Digest != LS.Digest ||
+            !(MainSource->getValue().Flags &
+              IncludeGraphNode::SourceFlag::IsTU) ||
+            Command.Directory.empty() || Command.CommandLine.empty() ||
+            LS.Shard->CC1CommandLine->empty() ||
+            LS.Shard->CC1CommandLine->front() != "-cc1")
+          Complete = false;
+        llvm::StringSet<> CanonicalContextPaths;
         for (const auto &Source : *LS.Shard->ContextSources) {
           auto AbsPath = URI::resolve(Source.first(), LS.AbsolutePath);
           if (!AbsPath) {
+            Complete = false;
+            break;
+          }
+          Path Canonical = removeDots(*AbsPath);
+          llvm::SmallString<256> Real;
+          if (!FS->getRealPath(Canonical, Real))
+            Canonical = Real.str().str();
+          if (!CanonicalContextPaths.insert(maybeCaseFoldPath(Canonical))
+                   .second) {
             Complete = false;
             break;
           }
@@ -858,13 +683,12 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles,
         if (Complete && llvm::any_of(Contexts, [&](const IndexedFile &File) {
               return File.File == LS.AbsolutePath;
             })) {
-          llvm::erase_if(IndexedFiles, [&](const IndexedFile &File) {
-            return File.DependentTU == LS.AbsolutePath;
-          });
           IndexedFiles.insert(IndexedFiles.end(),
                               std::make_move_iterator(Contexts.begin()),
                               std::make_move_iterator(Contexts.end()));
           IndexedCommands[LS.AbsolutePath] = std::move(Command);
+          IndexedCC1Commands[LS.AbsolutePath] =
+              std::move(*LS.Shard->CC1CommandLine);
           FreshlyIndexedTUs.insert(LS.AbsolutePath);
           LoadedExactTranslationUnits.insert(LS.AbsolutePath);
         }
@@ -889,7 +713,6 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles,
   Rebuilder.loadedShard(LoadedShards);
   Rebuilder.doneLoading();
 
-  auto FS = TFS.view(/*CWD=*/std::nullopt);
   llvm::DenseSet<PathRef> TUsToIndex;
   // A missing or malformed main-file shard cannot be accepted as a cache hit.
   // Index it so an unreadable TU becomes an explicit graph failure and a

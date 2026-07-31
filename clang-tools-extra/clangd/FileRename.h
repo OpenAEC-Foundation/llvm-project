@@ -47,6 +47,18 @@ struct ConditionalInclusion {
   int HashLine = 0;
 };
 
+struct FileRenameDirectiveScan {
+  std::string Contents;
+  FileDigest Digest{{0}};
+  bool HasIncludeDirectives = false;
+  std::vector<ConditionalInclusion> ConditionalIncludes;
+};
+
+/// Reads and scans a frozen file once, returning both the exact contents and
+/// all directive facts needed by file-rename validation.
+llvm::Expected<FileRenameDirectiveScan>
+scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS);
+
 /// Returns inclusion directives controlled by genuine preprocessor choices.
 /// A conventional whole-file include guard is not considered conditional.
 /// Written is empty when the operand is macro-generated.
@@ -62,7 +74,8 @@ llvm::Error validateCompileCommandForRenames(
     const tooling::CompileCommand &Command,
     llvm::ArrayRef<std::pair<Path, Path>> Renames,
     llvm::ArrayRef<FileRenameMapping> ExpandedRenames = {},
-    llvm::vfs::FileSystem *FS = nullptr);
+    llvm::vfs::FileSystem *FS = nullptr,
+    llvm::ArrayRef<std::string> DriverDerivedCC1Args = {});
 
 /// Rejects context-dependent edit results. A file must have one unambiguous
 /// set of edits across every translation-unit context in which it appears.

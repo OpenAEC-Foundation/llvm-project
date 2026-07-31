@@ -8,6 +8,7 @@
 
 #include "FileRename.h"
 #include "Config.h"
+#include "FileRenameInternal.h"
 #include "SourceCode.h"
 #include "support/Logger.h"
 #include "clang/Lex/DependencyDirectivesScanner.h"
@@ -28,6 +29,42 @@
 
 namespace clang {
 namespace clangd {
+
+bool fileRenamePathInside(PathRef Ancestor, PathRef Path) {
+  if (Ancestor == Path)
+    return true;
+  if (!Path.starts_with(Ancestor))
+    return false;
+  return Path.size() > Ancestor.size() &&
+         llvm::sys::path::is_separator(Path[Ancestor.size()]);
+}
+
+llvm::Expected<Path> fileRenameCanonicalPath(PathRef Path,
+                                             llvm::vfs::FileSystem &FS) {
+  llvm::SmallString<256> Existing(Path);
+  llvm::SmallVector<llvm::StringRef> MissingComponents;
+  while (true) {
+    if (auto S = FS.status(Existing)) {
+      llvm::SmallString<256> Real;
+      if (std::error_code EC = FS.getRealPath(Existing, Real))
+        return error("cannot resolve real path {0}: {1}", Existing,
+                     EC.message());
+      for (llvm::StringRef Component : llvm::reverse(MissingComponents))
+        llvm::sys::path::append(Real, Component);
+      llvm::sys::path::remove_dots(Real, /*remove_dot_dot=*/true);
+      return Real.str().str();
+    } else if (S.getError() != std::errc::no_such_file_or_directory) {
+      return error("cannot inspect path {0}: {1}", Existing,
+                   S.getError().message());
+    }
+    llvm::StringRef Filename = llvm::sys::path::filename(Existing);
+    if (Filename.empty())
+      return error("cannot find an existing ancestor of {0}", Path);
+    MissingComponents.push_back(Filename);
+    llvm::sys::path::remove_filename(Existing);
+  }
+}
+
 namespace {
 
 llvm::Expected<Path> normalizeAbsolute(PathRef Path) {
@@ -59,46 +96,12 @@ scanDependencyDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   return Result;
 }
 
-bool pathInsideExact(PathRef Ancestor, PathRef Path) {
-  if (Ancestor == Path)
-    return true;
-  if (!Path.starts_with(Ancestor))
-    return false;
-  return Path.size() > Ancestor.size() &&
-         llvm::sys::path::is_separator(Path[Ancestor.size()]);
-}
-
-llvm::Expected<Path> canonicalPath(PathRef Path, llvm::vfs::FileSystem &FS) {
-  llvm::SmallString<256> Existing(Path);
-  llvm::SmallVector<llvm::StringRef> MissingComponents;
-  while (true) {
-    if (auto S = FS.status(Existing)) {
-      llvm::SmallString<256> Real;
-      if (std::error_code EC = FS.getRealPath(Existing, Real))
-        return error("cannot resolve real path {0}: {1}", Existing,
-                     EC.message());
-      for (llvm::StringRef Component : llvm::reverse(MissingComponents))
-        llvm::sys::path::append(Real, Component);
-      llvm::sys::path::remove_dots(Real, /*remove_dot_dot=*/true);
-      return Real.str().str();
-    } else if (S.getError() != std::errc::no_such_file_or_directory) {
-      return error("cannot inspect path {0}: {1}", Existing,
-                   S.getError().message());
-    }
-    llvm::StringRef Filename = llvm::sys::path::filename(Existing);
-    if (Filename.empty())
-      return error("cannot find an existing ancestor of {0}", Path);
-    MissingComponents.push_back(Filename);
-    llvm::sys::path::remove_filename(Existing);
-  }
-}
-
 llvm::Error checkInsideWorkspace(PathRef Path, PathRef CanonicalWorkspaceRoot,
                                  llvm::vfs::FileSystem &FS) {
-  auto Real = canonicalPath(Path, FS);
+  auto Real = fileRenameCanonicalPath(Path, FS);
   if (!Real)
     return Real.takeError();
-  if (!pathInsideExact(CanonicalWorkspaceRoot, *Real))
+  if (!fileRenamePathInside(CanonicalWorkspaceRoot, *Real))
     return error("file rename path is outside the workspace: {0}", Path);
   return llvm::Error::success();
 }
@@ -116,10 +119,10 @@ llvm::Error checkDestination(PathRef OldPath, PathRef NewPath,
                              const llvm::vfs::Status &OldStatus,
                              llvm::vfs::FileSystem &FS) {
   if (auto Existing = FS.status(NewPath)) {
-    auto RealOld = canonicalPath(OldPath, FS);
+    auto RealOld = fileRenameCanonicalPath(OldPath, FS);
     if (!RealOld)
       return RealOld.takeError();
-    auto RealNew = canonicalPath(NewPath, FS);
+    auto RealNew = fileRenameCanonicalPath(NewPath, FS);
     if (!RealNew)
       return RealNew.takeError();
     if (*RealOld != *RealNew ||
@@ -370,7 +373,7 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
   auto NormalizedRoot = normalizeAbsolute(WorkspaceRoot);
   if (!NormalizedRoot)
     return NormalizedRoot.takeError();
-  auto CanonicalRoot = canonicalPath(*NormalizedRoot, FS);
+  auto CanonicalRoot = fileRenameCanonicalPath(*NormalizedRoot, FS);
   if (!CanonicalRoot)
     return CanonicalRoot.takeError();
 
@@ -402,17 +405,19 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
     }
     if (!OldStatus->isDirectory())
       return error("rename source is neither a file nor directory: {0}", *Old);
-    auto CanonicalOld = canonicalPath(*Old, FS);
+    auto CanonicalOld = fileRenameCanonicalPath(*Old, FS);
     if (!CanonicalOld)
       return CanonicalOld.takeError();
-    auto CanonicalNew = canonicalPath(*New, FS);
+    auto CanonicalNew = fileRenameCanonicalPath(*New, FS);
     if (!CanonicalNew)
       return CanonicalNew.takeError();
-    if (pathInsideExact(*CanonicalOld, *CanonicalNew))
+    if (fileRenamePathInside(*CanonicalOld, *CanonicalNew))
       return error("rename destination is inside its source directory: {0}",
                    *New);
     if (auto Err = checkDestination(*Old, *New, *OldStatus, FS))
       return std::move(Err);
+    if (fileRenamePrunesDirectory(*Old))
+      continue;
 
     std::error_code EC;
     llvm::vfs::recursive_directory_iterator It(FS, *Old, EC), End;
@@ -427,6 +432,10 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
       if (!EntryStatus)
         return error("cannot inspect rename entry {0}: {1}", It->path(),
                      EntryStatus.getError().message());
+      if (EntryStatus->isDirectory() && fileRenamePrunesDirectory(It->path())) {
+        It.no_push();
+        continue;
+      }
       if (!EntryStatus->isRegularFile())
         continue;
       llvm::SmallString<256> Relative(It->path());
@@ -451,13 +460,22 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
   return Result;
 }
 
-llvm::Expected<std::vector<ConditionalInclusion>>
-conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
+llvm::Expected<FileRenameDirectiveScan>
+scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   auto Scan = scanDependencyDirectives(File, FS);
   if (!Scan)
     return Scan.takeError();
   const auto &Directives = (*Scan)->Directives;
   llvm::StringRef Code = (*Scan)->Buffer->getBuffer();
+  FileRenameDirectiveScan Result;
+  Result.Contents = Code.str();
+  Result.Digest = digest(Code);
+  Result.HasIncludeDirectives =
+      llvm::any_of(Directives, [](const auto &Directive) {
+        using namespace dependency_directives_scan;
+        return Directive.Kind == pp_include ||
+               Directive.Kind == pp_include_next || Directive.Kind == pp_import;
+      });
   auto MacroName = [&](const dependency_directives_scan::Directive &Directive) {
     unsigned RawIdentifiers = 0;
     for (const auto &Token : Directive.Tokens)
@@ -483,7 +501,6 @@ conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
       !MacroName(Directives[First]).empty() &&
       MacroName(Directives[First]) == MacroName(Directives[First + 1]);
 
-  std::vector<ConditionalInclusion> Result;
   unsigned ConditionalDepth = 0;
   bool InGuardAlternative = false;
   for (const auto &Directive : Directives) {
@@ -525,7 +542,7 @@ conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
             Inclusion.Written = Code.slice(Token.Offset, Token.getEnd()).str();
         }
         Inclusion.HashLine = offsetToPosition(Code, Inclusion.HashOffset).line;
-        Result.push_back(std::move(Inclusion));
+        Result.ConditionalIncludes.push_back(std::move(Inclusion));
       }
       break;
     default:
@@ -537,211 +554,44 @@ conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   return Result;
 }
 
-llvm::Expected<bool> hasIncludeDirectives(PathRef File,
-                                          llvm::vfs::FileSystem &FS) {
-  auto Scan = scanDependencyDirectives(File, FS);
-  if (!Scan)
-    return Scan.takeError();
-  return llvm::any_of((*Scan)->Directives, [](const auto &Directive) {
-    using namespace dependency_directives_scan;
-    return Directive.Kind == pp_include || Directive.Kind == pp_include_next ||
-           Directive.Kind == pp_import;
-  });
+llvm::Expected<const FileRenameDirectiveScan *>
+FileRenameDirectiveCache::scan(PathRef File, FileDigest ExpectedDigest) {
+  auto Canonical = fileRenameCanonicalPath(File, FS);
+  if (!Canonical)
+    return Canonical.takeError();
+  std::string Key = maybeCaseFoldPath(*Canonical);
+  auto Existing = Scans.find(Key);
+  if (Existing != Scans.end()) {
+    if (Existing->getValue().Digest != ExpectedDigest)
+      return error("canonical workspace aliases have different contents: {0}",
+                   File);
+    return &Existing->getValue().Scan;
+  }
+  auto Result = scanFileRenameDirectives(File, FS);
+  if (!Result)
+    return Result.takeError();
+  if (Result->Digest != ExpectedDigest)
+    return error("workspace contents do not match the frozen digest for {0}",
+                 File);
+  auto Inserted =
+      Scans.try_emplace(Key, CachedScan{ExpectedDigest, std::move(*Result)});
+  return &Inserted.first->getValue().Scan;
 }
 
-llvm::Error validateCompileCommandForRenames(
-    const tooling::CompileCommand &Command,
-    llvm::ArrayRef<std::pair<Path, Path>> Renames,
-    llvm::ArrayRef<FileRenameMapping> ExpandedRenames,
-    llvm::vfs::FileSystem *FS) {
-  assert(ExpandedRenames.empty() == (FS == nullptr) &&
-         "expanded renames and filesystem must be provided together");
-  auto CheckPath = [&](llvm::StringRef Value,
-                       llvm::StringRef Option) -> llvm::Error {
-    if (Value.empty())
-      return error("compiler option {0} has an empty path", Option);
-    if (Option.starts_with("-fmodule-file")) {
-      size_t Equals = Value.rfind('=');
-      if (Equals != llvm::StringRef::npos)
-        Value = Value.drop_front(Equals + 1);
-    }
-    llvm::SmallString<256> Absolute(Value);
-    if (!llvm::sys::path::is_absolute(Absolute)) {
-      Absolute = Command.Directory;
-      llvm::sys::path::append(Absolute, Value);
-    }
-    llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
-    auto Mapped = mapPathAfterRenames(Absolute, Renames);
-    if (!Mapped)
-      return Mapped.takeError();
-    if (*Mapped != Absolute)
-      return error("file rename moves compiler path {0} from option {1}",
-                   Absolute, Option);
-    if (FS) {
-      auto Canonical = canonicalPath(Absolute, *FS);
-      if (!Canonical)
-        return Canonical.takeError();
-      for (const auto &Rename : Renames) {
-        auto CanonicalOld = canonicalPath(Rename.first, *FS);
-        if (!CanonicalOld)
-          return CanonicalOld.takeError();
-        if (pathInsideExact(*CanonicalOld, *Canonical))
-          return error("file rename moves compiler path {0} from option {1}",
-                       Absolute, Option);
-      }
-      auto S = FS->status(Absolute);
-      if (S) {
-        if (llvm::any_of(ExpandedRenames, [&](const auto &Rename) {
-              return Rename.OldIdentity == S->getUniqueID();
-            }))
-          return error("file rename moves compiler path {0} from option {1}",
-                       Absolute, Option);
-      } else if (S.getError() != std::errc::no_such_file_or_directory) {
-        return error("cannot inspect compiler path {0} from option {1}: {2}",
-                     Absolute, Option, S.getError().message());
-      }
-    }
-    return llvm::Error::success();
-  };
+llvm::Expected<std::vector<ConditionalInclusion>>
+conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
+  auto Scan = scanFileRenameDirectives(File, FS);
+  if (!Scan)
+    return Scan.takeError();
+  return std::move(Scan->ConditionalIncludes);
+}
 
-  if (auto Err = CheckPath(Command.Directory, "compilation working directory"))
-    return Err;
-
-  if (Command.CommandLine.empty())
-    return error("compiler command line is empty");
-
-  llvm::ArrayRef<std::string> CommandArgs = Command.CommandLine;
-  for (llvm::StringRef Arg : CommandArgs.drop_front()) {
-    if (Arg.starts_with("@"))
-      return error(
-          "cannot prove compiler response file paths after rename: {0}", Arg);
-  }
-
-  static constexpr unsigned PathOptions[] = {
-      options::OPT_I,
-      options::OPT_F,
-      options::OPT_embed_dir_EQ,
-      options::OPT_gcc_toolchain,
-      options::OPT__sysroot_EQ,
-      options::OPT_resource_dir,
-      options::OPT_resource_dir_EQ,
-      options::OPT_fmodule_map_file,
-      options::OPT_fmodule_file,
-      options::OPT_fprebuilt_module_path,
-      options::OPT_fmodules_cache_path,
-      options::OPT_fmodules_user_build_path,
-      options::OPT_include,
-      options::OPT_include_pch,
-      options::OPT_imacros,
-      options::OPT_iprefix,
-      options::OPT_iquote,
-      options::OPT_isysroot,
-      options::OPT_isystem,
-      options::OPT_isystem_after,
-      options::OPT_iwithprefix,
-      options::OPT_iwithprefixbefore,
-      options::OPT_iwithsysroot,
-      options::OPT_idirafter,
-      options::OPT_iframework,
-      options::OPT_iframeworkwithsysroot,
-      options::OPT_iapinotes_modules,
-      options::OPT_ivfsoverlay,
-      options::OPT_vfsoverlay,
-      options::OPT_working_directory,
-      options::OPT_working_directory_EQ,
-      options::OPT_c_isystem,
-      options::OPT_objc_isystem,
-      options::OPT_objcxx_isystem,
-      options::OPT_internal_iframework,
-      options::OPT_internal_isystem,
-      options::OPT_internal_externc_isystem,
-      options::OPT_chain_include,
-  };
-  auto ParseAndCheck = [&](llvm::ArrayRef<llvm::StringRef> Args,
-                           llvm::opt::Visibility Visibility) -> llvm::Error {
-    llvm::SmallVector<const char *> RawArgs;
-    RawArgs.reserve(Args.size());
-    for (llvm::StringRef Arg : Args)
-      RawArgs.push_back(Arg.data());
-    unsigned MissingIndex = 0;
-    unsigned MissingCount = 0;
-    llvm::opt::InputArgList Parsed = getDriverOptTable().ParseArgs(
-        RawArgs, MissingIndex, MissingCount, Visibility);
-    if (MissingCount)
-      return error("compiler option {0} has no path", Args[MissingIndex]);
-    llvm::StringRef Sysroot;
-    for (const llvm::opt::Arg *Arg : Parsed)
-      if (Arg->getOption().matches(options::OPT_isysroot) ||
-          Arg->getOption().matches(options::OPT__sysroot_EQ))
-        Sysroot = Arg->getValue();
-    llvm::StringRef IncludePrefix;
-    for (const llvm::opt::Arg *Arg : Parsed) {
-      if (!llvm::any_of(PathOptions, [&](unsigned ID) {
-            return Arg->getOption().matches(ID);
-          }))
-        continue;
-      if (Arg->getNumValues() != 1)
-        return error("compiler option {0} does not have exactly one path",
-                     Arg->getSpelling());
-      if (Arg->getOption().matches(options::OPT_iprefix)) {
-        IncludePrefix = Arg->getValue();
-        if (auto Err = CheckPath(IncludePrefix, Arg->getSpelling()))
-          return Err;
-        continue;
-      }
-      if (Arg->getOption().matches(options::OPT_iwithprefix) ||
-          Arg->getOption().matches(options::OPT_iwithprefixbefore)) {
-        std::string Composed = (IncludePrefix + Arg->getValue()).str();
-        if (auto Err = CheckPath(Composed, Arg->getSpelling()))
-          return Err;
-        continue;
-      }
-      if (!Sysroot.empty() &&
-          (Arg->getOption().matches(options::OPT_iwithsysroot) ||
-           Arg->getOption().matches(options::OPT_iframeworkwithsysroot)) &&
-          llvm::sys::path::is_absolute(Arg->getValue())) {
-        if (auto Err = CheckPath((Sysroot + Arg->getValue()).str(),
-                                 Arg->getSpelling()))
-          return Err;
-        continue;
-      }
-      bool ExpandsEqualsPath =
-          Arg->getOption().matches(options::OPT_I) ||
-          Arg->getOption().matches(options::OPT_idirafter) ||
-          Arg->getOption().matches(options::OPT_iquote) ||
-          Arg->getOption().matches(options::OPT_isystem);
-      llvm::StringRef Value = Arg->getValue();
-      if (!Sysroot.empty() && ExpandsEqualsPath && Value.starts_with("=")) {
-        llvm::SmallString<256> Expanded(Sysroot);
-        llvm::sys::path::append(Expanded, Value.drop_front());
-        if (auto Err = CheckPath(Expanded, Arg->getSpelling()))
-          return Err;
-        continue;
-      }
-      if (auto Err = CheckPath(Arg->getValue(), Arg->getSpelling()))
-        return Err;
-    }
-    return llvm::Error::success();
-  };
-
-  llvm::SmallVector<llvm::StringRef> DriverArgs;
-  llvm::SmallVector<llvm::StringRef> CC1Args;
-  for (size_t I = 1; I < CommandArgs.size(); ++I) {
-    if (CommandArgs[I] == "-Xclang") {
-      if (++I == CommandArgs.size())
-        return error("compiler option -Xclang has no argument");
-      CC1Args.push_back(CommandArgs[I]);
-    } else {
-      DriverArgs.push_back(CommandArgs[I]);
-    }
-  }
-  if (auto Err = ParseAndCheck(DriverArgs,
-                               llvm::opt::Visibility(options::ClangOption)))
-    return Err;
-  if (auto Err =
-          ParseAndCheck(CC1Args, llvm::opt::Visibility(options::CC1Option)))
-    return Err;
-  return llvm::Error::success();
+llvm::Expected<bool> hasIncludeDirectives(PathRef File,
+                                          llvm::vfs::FileSystem &FS) {
+  auto Scan = scanFileRenameDirectives(File, FS);
+  if (!Scan)
+    return Scan.takeError();
+  return Scan->HasIncludeDirectives;
 }
 
 llvm::Error validateCompatibleFileRenameEdits(PathRef File,

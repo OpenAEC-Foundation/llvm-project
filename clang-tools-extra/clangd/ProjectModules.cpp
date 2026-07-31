@@ -63,8 +63,8 @@ parseCompileCommandInfo(tooling::CompileCommand Cmd, const ThreadsafeFS &TFS) {
   auto Tokenizer = llvm::Triple(llvm::sys::getProcessTriple()).isOSWindows()
                        ? llvm::cl::TokenizeWindowsCommandLine
                        : llvm::cl::TokenizeGNUCommandLine;
-  tooling::addExpandedResponseFiles(Cmd.CommandLine, Cmd.Directory, Tokenizer,
-                                    *FS);
+  Cmd.HadResponseFile |= tooling::addExpandedResponseFiles(
+      Cmd.CommandLine, Cmd.Directory, Tokenizer, *FS);
 
   ParsedCompileCommandInfo Result;
   Result.SourceFile = normalizePath(Cmd.Filename, Cmd.Directory);
