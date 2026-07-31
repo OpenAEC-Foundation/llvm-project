@@ -93,6 +93,24 @@ public:
                    EC.message());
     return llvm::Error::success();
   }
+
+  llvm::Error clear() const override {
+    std::error_code EC;
+    for (llvm::sys::fs::directory_iterator It(DiskShardRoot, EC), End;
+         It != End && !EC; It.increment(EC)) {
+      if (!llvm::StringRef(It->path()).ends_with(".idx"))
+        continue;
+      if (std::error_code Remove = llvm::sys::fs::remove(It->path()))
+        return error("failed to remove index shard {0}: {1}", It->path(),
+                     Remove.message());
+    }
+    if (EC == std::errc::no_such_file_or_directory)
+      return llvm::Error::success();
+    if (EC)
+      return error("failed to enumerate index cache {0}: {1}", DiskShardRoot,
+                   EC.message());
+    return llvm::Error::success();
+  }
 };
 
 // Doesn't persist index shards anywhere (used when the CDB dir is unknown).
@@ -114,6 +132,8 @@ public:
   llvm::Error removeShard(llvm::StringRef) const override {
     return llvm::Error::success();
   }
+
+  llvm::Error clear() const override { return llvm::Error::success(); }
 };
 
 // Creates and owns IndexStorages for multiple CDBs.

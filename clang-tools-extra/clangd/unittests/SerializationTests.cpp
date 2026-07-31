@@ -292,6 +292,53 @@ TEST(SerializationTest, SrcsTest) {
   }
 }
 
+TEST(SerializationTest, ContextSourcesRoundTripAndRejectsUnknownSchema) {
+  auto In = readIndexFile(YAML);
+  ASSERT_TRUE(bool(In)) << In.takeError();
+
+  IncludeGraph Context;
+  IncludeGraphNode Main;
+  Main.URI = "file:///workspace/main.cpp";
+  Main.Digest = digest("main");
+  Main.DirectIncludes = {"file:///workspace/common.h"};
+  Main.Flags |= IncludeGraphNode::SourceFlag::IsTU;
+  Context[Main.URI] = Main;
+  IncludeGraphNode Header;
+  Header.URI = "file:///workspace/common.h";
+  Header.Digest = digest("header");
+  Header.Flags |= IncludeGraphNode::SourceFlag::HasConditionalIncludes;
+  Context[Header.URI] = Header;
+
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  Out.ContextSources = &Context;
+  std::string Serialized = llvm::to_string(Out);
+  auto RoundTrip = readIndexFile(Serialized);
+  ASSERT_TRUE(bool(RoundTrip)) << RoundTrip.takeError();
+  ASSERT_TRUE(RoundTrip->ContextSources);
+  EXPECT_THAT(RoundTrip->ContextSources->keys(),
+              UnorderedElementsAre(Main.URI, Header.URI));
+  EXPECT_THAT(RoundTrip->ContextSources->lookup(Main.URI).DirectIncludes,
+              ElementsAre(Header.URI));
+  EXPECT_TRUE(RoundTrip->ContextSources->lookup(Header.URI).Flags &
+              IncludeGraphNode::SourceFlag::HasConditionalIncludes);
+
+  auto Parsed = riff::readFile(Serialized);
+  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
+  auto ContextChunk = llvm::find_if(Parsed->Chunks, [](riff::Chunk C) {
+    return C.ID == riff::fourCC("ctxs");
+  });
+  ASSERT_NE(ContextChunk, Parsed->Chunks.end());
+  ASSERT_GE(ContextChunk->Data.size(), 4U);
+  std::string UnknownSchema = ContextChunk->Data.str();
+  UnknownSchema[0] = 2;
+  ContextChunk->Data = UnknownSchema;
+  auto Rejected = readIndexFile(llvm::to_string(*Parsed));
+  ASSERT_FALSE(bool(Rejected));
+  EXPECT_THAT(llvm::toString(Rejected.takeError()),
+              testing::HasSubstr("context include graph schema"));
+}
+
 TEST(SerializationTest, CmdlTest) {
   auto In = readIndexFile(YAML);
   EXPECT_TRUE(bool(In)) << In.takeError();

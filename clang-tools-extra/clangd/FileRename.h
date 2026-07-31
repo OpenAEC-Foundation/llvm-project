@@ -11,6 +11,7 @@
 
 #include "Headers.h"
 #include "Protocol.h"
+#include "WorkspaceSourceCache.h"
 #include "support/Path.h"
 #include "clang/Format/Format.h"
 #include "clang/Tooling/CompilationDatabase.h"
@@ -29,11 +30,6 @@ struct FileRenameMapping {
   llvm::sys::fs::UniqueID OldIdentity;
 };
 
-struct WorkspaceSourceFile {
-  Path File;
-  bool IsHeader = false;
-};
-
 /// Expands directory renames into file renames and validates the complete set.
 ///
 /// Old paths must exist inside WorkspaceRoot. New paths must also be inside the
@@ -44,9 +40,6 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
 
 /// Enumerates source and header files whose include directives must be
 /// represented in the background include graph.
-llvm::Expected<std::vector<WorkspaceSourceFile>>
-workspaceSourceFiles(PathRef WorkspaceRoot, llvm::vfs::FileSystem &FS);
-
 struct ConditionalInclusion {
   tok::PPKeywordKind Directive = tok::pp_not_keyword;
   std::string Written;

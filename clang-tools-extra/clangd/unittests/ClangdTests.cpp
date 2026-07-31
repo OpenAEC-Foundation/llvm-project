@@ -1384,6 +1384,32 @@ $inactive4[[  int inactiveInt3;]]
                   Source.range("inactive3"), Source.range("inactive4"))));
 }
 
+class CountingWorkspaceFS : public MockFS {
+  class View : public llvm::vfs::ProxyFileSystem {
+  public:
+    View(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> Base,
+         std::atomic<unsigned> &RootReads)
+        : ProxyFileSystem(std::move(Base)), RootReads(RootReads) {}
+
+    llvm::vfs::directory_iterator dir_begin(const llvm::Twine &Directory,
+                                            std::error_code &EC) override {
+      if (Directory.str() == testRoot())
+        ++RootReads;
+      return ProxyFileSystem::dir_begin(Directory, EC);
+    }
+
+  private:
+    std::atomic<unsigned> &RootReads;
+  };
+
+public:
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> viewImpl() const override {
+    return new View(MockFS::viewImpl(), RootDirectoryReads);
+  }
+
+  mutable std::atomic<unsigned> RootDirectoryReads{0};
+};
+
 TEST(ClangdServerFileRename, ReturnsVersionedDocumentChanges) {
   MockFS FS;
   const Path Main = testPath("main.cpp");
@@ -1410,6 +1436,31 @@ TEST(ClangdServerFileRename, ReturnsVersionedDocumentChanges) {
   ASSERT_THAT(Edit.edits, SizeIs(1));
   EXPECT_EQ(Edit.edits.front().newText, "\"new.h\"");
   EXPECT_FALSE(Result->changes);
+}
+
+TEST(ClangdServerFileRename, ReusesWorkspaceInventoryAcrossPreparations) {
+  CountingWorkspaceFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  ASSERT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::Succeeded());
+  const unsigned AfterFirst = FS.RootDirectoryReads;
+  ASSERT_GT(AfterFirst, 0U);
+  ASSERT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::Succeeded());
+  EXPECT_EQ(FS.RootDirectoryReads, AfterFirst);
 }
 
 TEST(ClangdServerFileRename, UpdatesIncludeInsideOrdinaryHeaderGuard) {
@@ -1498,6 +1549,86 @@ TEST(ClangdServerFileRename, RejectsOrphanWorkspaceSource) {
   EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
                        llvm::FailedWithMessage(testing::HasSubstr(
                            "not represented in the background include graph")));
+}
+
+TEST(ClangdServerFileRename, RejectsOrphanWorkspaceIncludeFragment) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Fragment = testPath("generated.inc");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "int main_value;\n";
+  FS.Files[Fragment] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::FailedWithMessage(testing::HasSubstr(
+                           "not represented in the background include graph")));
+}
+
+TEST(ClangdServerFileRename, RejectsStaleRepresentedClosedFile) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Other = testPath("other.h");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"other.h\"\n";
+  FS.Files[Other] = "";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  FS.Files[Other] = "#include \"old.h\"\n";
+  EXPECT_THAT_EXPECTED(
+      runPrepareFileRename(Server, {{{Old}, {New}}}),
+      llvm::FailedWithMessage(testing::HasSubstr("include graph is stale")));
+}
+
+TEST(ClangdServerFileRename, IgnoresUnrelatedConditionalMacroInclude) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Other = testPath("other.h");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"old.h\"\n#include \"other.h\"\n";
+  FS.Files[Other] = R"cpp(
+#if ENABLE_EXTRA
+#include EXTRA_HEADER
+#include_next "unrelated.h"
+#endif
+)cpp";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  auto Command = commandFor(Main);
+  Command.CommandLine.insert(Command.CommandLine.begin() + 1,
+                             "-DENABLE_EXTRA=0");
+  CDB.setCompileCommand(Main, std::move(Command));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().textDocument.uri.file(), Main);
 }
 
 TEST(ClangdServerFileRename, RejectsDraftChangeDuringPreparation) {

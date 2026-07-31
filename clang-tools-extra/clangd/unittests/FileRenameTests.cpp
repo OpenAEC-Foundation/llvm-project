@@ -319,6 +319,118 @@ TEST(FileRename, RejectsMovedCompilerConfigurationPaths) {
   }
 }
 
+TEST(FileRename, RejectsAllIncludeModuleAndVFSCompilerPaths) {
+  tooling::CompileCommand Command;
+  Command.Directory = "/workspace";
+  Command.Filename = "/workspace/main.cpp";
+  const std::pair<Path, Path> Rename{"/workspace/config", "/workspace/moved"};
+  for (std::vector<std::string> Args : {
+           std::vector<std::string>{"clang", "-I", "/workspace/config"},
+           std::vector<std::string>{"clang", "-F/workspace/config"},
+           std::vector<std::string>{"clang", "--embed-dir=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "--gcc-toolchain=/workspace/config"},
+           std::vector<std::string>{"clang", "--sysroot=/workspace/config"},
+           std::vector<std::string>{"clang", "-resource-dir",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-resource-dir=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fmodule-map-file=/workspace/config/map"},
+           std::vector<std::string>{
+               "clang", "-fmodule-file=Named=/workspace/config/module.pcm"},
+           std::vector<std::string>{"clang",
+                                    "-fprebuilt-module-path=/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-fmodules-cache-path=/workspace/config"},
+           std::vector<std::string>{"clang", "-fmodules-user-build-path",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-include",
+                                    "/workspace/config/header.h"},
+           std::vector<std::string>{"clang", "-include-pch",
+                                    "/workspace/config/header.pch"},
+           std::vector<std::string>{"clang", "-imacros",
+                                    "/workspace/config/macros.h"},
+           std::vector<std::string>{"clang", "-iprefix", "/workspace/config"},
+           std::vector<std::string>{"clang", "-iwithprefix/workspace/config"},
+           std::vector<std::string>{"clang", "-iwithprefixbefore",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-iwithsysroot/workspace/config"},
+           std::vector<std::string>{"clang", "-iquote", "/workspace/config"},
+           std::vector<std::string>{"clang", "-isysroot", "/workspace/config"},
+           std::vector<std::string>{"clang", "-isystem", "/workspace/config"},
+           std::vector<std::string>{"clang", "-isystem-after",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-idirafter", "/workspace/config"},
+           std::vector<std::string>{"clang", "-iframework",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-iframeworkwithsysroot",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-iapinotes-modules",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-ivfsoverlay",
+                                    "/workspace/config/vfs.yaml"},
+           std::vector<std::string>{"clang", "-vfsoverlay",
+                                    "/workspace/config/vfs.yaml"},
+           std::vector<std::string>{"clang", "-working-directory",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang",
+                                    "-working-directory=/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-c-isystem", "-Xclang",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-objc-isystem",
+                                    "-Xclang", "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-objcxx-isystem",
+                                    "-Xclang", "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-internal-iframework",
+                                    "-Xclang", "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-internal-isystem",
+                                    "-Xclang", "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang",
+                                    "-internal-externc-isystem", "-Xclang",
+                                    "/workspace/config"},
+           std::vector<std::string>{"clang", "-Xclang", "-chain-include",
+                                    "-Xclang", "/workspace/config/header.pch"},
+       }) {
+    Command.CommandLine = std::move(Args);
+    EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+}
+
+TEST(FileRename, ResolvesIncludePrefixOptionsBeforeValidation) {
+  tooling::CompileCommand Command;
+  Command.Directory = "/workspace/build";
+  Command.Filename = "/workspace/main.cpp";
+  for (llvm::StringRef WithPrefix : {"-iwithprefix", "-iwithprefixbefore"}) {
+    Command.CommandLine = {"clang", "-iprefix", "/workspace/sdk/",
+                           WithPrefix.str(), "include"};
+    EXPECT_THAT_ERROR(
+        validateCompileCommandForRenames(
+            Command, {{"/workspace/sdk/include", "/workspace/sdk/renamed"}}),
+        llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+}
+
+TEST(FileRename, ResolvesSysrootSearchOptionsBeforeValidation) {
+  tooling::CompileCommand Command;
+  Command.Directory = "/workspace/build";
+  Command.Filename = "/workspace/main.cpp";
+  for (std::vector<std::string> Args : {
+           std::vector<std::string>{"clang", "-isysroot", "/workspace/sdk",
+                                    "-iwithsysroot", "/include"},
+           std::vector<std::string>{"clang", "--sysroot=/workspace/sdk",
+                                    "-iframeworkwithsysroot", "/include"},
+           std::vector<std::string>{"clang", "-isysroot", "/workspace/sdk",
+                                    "-I=include"},
+       }) {
+    Command.CommandLine = std::move(Args);
+    EXPECT_THAT_ERROR(
+        validateCompileCommandForRenames(
+            Command, {{"/workspace/sdk/include", "/workspace/sdk/renamed"}}),
+        llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+}
+
 TEST(FileRename, RejectsMovedWorkingDirectoryAndResponseFiles) {
   tooling::CompileCommand Command;
   Command.Directory = "/workspace/config";
@@ -373,7 +485,11 @@ TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
   MockFS FS;
   FS.Files[testPath("main.cpp")] = "";
   FS.Files[testPath("include/header.h")] = "";
+  FS.Files[testPath("include/fragment.inc")] = "#include \"old.h\"\n";
+  FS.Files[testPath("generated")] = "#include <old.h>\n";
   FS.Files[testPath("README.md")] = "";
+  FS.Files[testPath("artifact.bin")] =
+      std::string("binary\0incidental include bytes", 31);
   auto VFS = FS.view(std::nullopt);
 
   auto Files = workspaceSourceFiles(testRoot(), *VFS);
@@ -384,10 +500,105 @@ TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
           testing::AllOf(
               testing::Field(&WorkspaceSourceFile::File, testPath("main.cpp")),
               testing::Field(&WorkspaceSourceFile::IsHeader, false)),
+          testing::AllOf(testing::Field(&WorkspaceSourceFile::File,
+                                        testPath("include/header.h")),
+                         testing::Field(&WorkspaceSourceFile::IsHeader, true)),
+          testing::AllOf(testing::Field(&WorkspaceSourceFile::File,
+                                        testPath("include/fragment.inc")),
+                         testing::Field(&WorkspaceSourceFile::IsHeader, true)),
           testing::AllOf(
-              testing::Field(&WorkspaceSourceFile::File,
-                             testPath("include/header.h")),
+              testing::Field(&WorkspaceSourceFile::File, testPath("generated")),
               testing::Field(&WorkspaceSourceFile::IsHeader, true))));
+}
+
+TEST(FileRename, EnforcesWorkspaceInventoryFileSizeLimit) {
+  for (bool KnownSource : {false, true}) {
+    const Path File = testPath(KnownSource ? "boundary.cpp" : "boundary.dat");
+    MockFS FS;
+    FS.Files[File] = std::string(MaxWorkspaceSourceFileSize, 'x');
+    auto VFS = FS.view(std::nullopt);
+    auto Files = workspaceSourceFiles(testRoot(), *VFS);
+    ASSERT_THAT_EXPECTED(Files, llvm::Succeeded());
+    if (KnownSource)
+      EXPECT_THAT(*Files, ElementsAre(testing::Field(&WorkspaceSourceFile::File,
+                                                     File)));
+    else
+      EXPECT_TRUE(Files->empty());
+  }
+
+  for (bool KnownSource : {false, true}) {
+    const Path File = testPath(KnownSource ? "oversized.cpp" : "oversized.dat");
+    MockFS FS;
+    FS.Files[File] = std::string(MaxWorkspaceSourceFileSize + 1, 'x');
+    auto VFS = FS.view(std::nullopt);
+    EXPECT_THAT_EXPECTED(
+        workspaceSourceFiles(testRoot(), *VFS),
+        llvm::FailedWithMessage(testing::AllOf(
+            HasSubstr(File), HasSubstr("file-rename inventory limit"))));
+  }
+}
+
+TEST(FileRename, ReusesWorkspaceInventoryWithoutRecursiveRescan) {
+  MockFS FS;
+  FS.Files[testPath("main.cpp")] = "#include \"header.h\"\n";
+  FS.Files[testPath("header.h")] = "";
+  auto Base = FS.view(std::nullopt);
+  llvm::IntrusiveRefCntPtr<llvm::vfs::TracingFileSystem> Tracing =
+      new llvm::vfs::TracingFileSystem(std::move(Base));
+  WorkspaceSourceCache Cache(testRoot());
+
+  auto First = Cache.snapshot(*Tracing);
+  ASSERT_THAT_EXPECTED(First, llvm::Succeeded());
+  ASSERT_GT(Tracing->NumDirBeginCalls, 0U);
+  const size_t DirectoryReads = Tracing->NumDirBeginCalls;
+  const size_t ContentReads = Tracing->NumOpenFileForReadCalls;
+
+  auto Second = Cache.snapshot(*Tracing);
+  ASSERT_THAT_EXPECTED(Second, llvm::Succeeded());
+  EXPECT_EQ(Tracing->NumDirBeginCalls, DirectoryReads);
+  EXPECT_EQ(Tracing->NumOpenFileForReadCalls, ContentReads);
+  EXPECT_EQ(Second->Digests.size(), First->Digests.size());
+  for (const auto &Entry : First->Digests)
+    EXPECT_EQ(Second->Digests.lookup(Entry.first()), Entry.getValue());
+}
+
+TEST(FileRename, RefreshesInvalidatedSameMetadataAndNestedFiles) {
+  MockFS FS;
+  const Path Header = testPath("header.h");
+  const Path Nested = testPath("generated/nested.inc");
+  FS.Files[Header] = "#include \"a.h\"\n";
+  FS.Timestamps[Header] = 1;
+  WorkspaceSourceCache Cache(testRoot());
+  auto View = FS.view(std::nullopt);
+  auto First = Cache.snapshot(*View);
+  ASSERT_THAT_EXPECTED(First, llvm::Succeeded());
+  FileDigest FirstDigest = First->Digests.lookup(Header);
+
+  // Identity, timestamp, and size are unchanged. The watched-file
+  // invalidation is what makes this replacement observable without rereading
+  // every cached file.
+  FS.Files[Header] = "#include \"b.h\"\n";
+  Cache.invalidate(Header);
+  View = FS.view(std::nullopt);
+  auto Changed = Cache.snapshot(*View);
+  ASSERT_THAT_EXPECTED(Changed, llvm::Succeeded());
+  EXPECT_NE(Changed->Digests.lookup(Header), FirstDigest);
+
+  FS.Files[Nested] = "#include \"b.h\"\n";
+  Cache.invalidate(Nested);
+  View = FS.view(std::nullopt);
+  auto Created = Cache.snapshot(*View);
+  ASSERT_THAT_EXPECTED(Created, llvm::Succeeded());
+  EXPECT_TRUE(Created->Digests.contains(Nested));
+  EXPECT_THAT(Created->Sources,
+              Contains(testing::Field(&WorkspaceSourceFile::File, Nested)));
+
+  FS.Files.erase(Nested);
+  Cache.invalidate(Nested);
+  View = FS.view(std::nullopt);
+  auto Deleted = Cache.snapshot(*View);
+  ASSERT_THAT_EXPECTED(Deleted, llvm::Succeeded());
+  EXPECT_FALSE(Deleted->Digests.contains(Nested));
 }
 
 TEST(FileRename, DetectsConditionalIncludeDirectives) {

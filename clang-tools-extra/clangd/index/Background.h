@@ -53,6 +53,10 @@ public:
   /// Removes a shard that no longer names a source file.
   virtual llvm::Error removeShard(llvm::StringRef ShardIdentifier) const = 0;
 
+  /// Removes every shard in this project cache. Used when persisted graph
+  /// metadata is unreadable and affected shard identities cannot be proven.
+  virtual llvm::Error clear() const = 0;
+
   // Tries to load shard with given identifier, returns nullptr if shard
   // couldn't be loaded.
   virtual std::unique_ptr<IndexFileIn>
@@ -254,6 +258,9 @@ private:
   FileSymbols IndexedSymbols;
   BackgroundIndexRebuilder Rebuilder;
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
+  // Serializes file-rename storage migration with index state/storage commits.
+  // Always acquire this before ShardVersionsMu.
+  std::mutex RenameMu;
   mutable std::mutex ShardVersionsMu;
   std::vector<IndexedFile> IndexedFiles;
   llvm::StringMap<tooling::CompileCommand> IndexedCommands;
@@ -271,10 +278,12 @@ private:
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.
-  std::vector<std::string> loadProject(std::vector<std::string> MainFiles);
+  std::vector<std::string> loadProject(std::vector<std::string> MainFiles,
+                                       uint64_t RequiredRenameEpoch);
 
   BackgroundQueue::Task
-  changedFilesTask(const std::vector<std::string> &ChangedFiles);
+  changedFilesTask(const std::vector<std::string> &ChangedFiles,
+                   uint64_t RequiredRenameEpoch);
   BackgroundQueue::Task
   indexFileTask(std::string Path, bool BypassDuplicateSuppression = false,
                 std::optional<uint64_t> RequiredRenameEpoch = std::nullopt);

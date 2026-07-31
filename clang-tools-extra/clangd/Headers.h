@@ -89,6 +89,10 @@ struct IncludeGraphNode {
     IsTU = 1 << 0,
     // Whether current file had any uncompilable errors during indexing.
     HadErrors = 1 << 1,
+    // Whether the file contains include/import directives nested under a
+    // preprocessor conditional. This is set only in persisted exact-context
+    // graphs after a successful scan.
+    HasConditionalIncludes = 1 << 2,
   };
 
   SourceFlag Flags = SourceFlag::None;

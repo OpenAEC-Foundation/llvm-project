@@ -46,6 +46,9 @@ struct IndexFileIn {
   std::optional<RelationSlab> Relations;
   // Keys are URIs of the source files.
   std::optional<IncludeGraph> Sources;
+  // Exact include graph for the translation-unit context represented by a
+  // main-file shard. This is absent from dependency shards.
+  std::optional<IncludeGraph> ContextSources;
   // This contains only the Directory and CommandLine.
   std::optional<tooling::CompileCommand> Cmd;
 };
@@ -59,6 +62,7 @@ struct IndexFileOut {
   const RelationSlab *Relations = nullptr;
   // Keys are URIs of the source files.
   const IncludeGraph *Sources = nullptr;
+  const IncludeGraph *ContextSources = nullptr;
   // TODO: Support serializing Dex posting lists.
   IndexFileFormat Format = IndexFileFormat::RIFF;
   const tooling::CompileCommand *Cmd = nullptr;
@@ -69,6 +73,7 @@ struct IndexFileOut {
         Refs(I.Refs ? &*I.Refs : nullptr),
         Relations(I.Relations ? &*I.Relations : nullptr),
         Sources(I.Sources ? &*I.Sources : nullptr),
+        ContextSources(I.ContextSources ? &*I.ContextSources : nullptr),
         Cmd(I.Cmd ? &*I.Cmd : nullptr) {}
 };
 // Serializes an index file.

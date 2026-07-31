@@ -43,6 +43,7 @@
 
 namespace clang {
 namespace clangd {
+class WorkspaceSourceCache;
 /// Manages a collection of source files and derived data (ASTs, indexes),
 /// and provides language-aware features such as code completion.
 ///
@@ -532,6 +533,7 @@ private:
   mutable std::mutex CachedCompletionFuzzyFindRequestMutex;
 
   std::optional<std::string> WorkspaceRoot;
+  std::unique_ptr<WorkspaceSourceCache> FileRenameWorkspace;
   std::optional<AsyncTaskRunner> IndexTasks; // for stdlib indexing.
   std::optional<TUScheduler> WorkScheduler;
   // Invalidation policy used for actions that we assume are "transient".

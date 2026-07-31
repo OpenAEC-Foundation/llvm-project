@@ -505,6 +505,25 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
       return error("malformed or truncated include uri");
   }
 
+  if (Chunks.count("ctxs")) {
+    Reader ContextReader(Chunks.lookup("ctxs"));
+    constexpr uint32_t ContextSchema = 1;
+    uint32_t Schema = ContextReader.consume32();
+    if (ContextReader.err() || Schema != ContextSchema)
+      return error("unsupported or malformed context include graph schema");
+    Result.ContextSources.emplace();
+    while (!ContextReader.eof()) {
+      auto IGN = readIncludeGraphNode(ContextReader, Strings->Strings);
+      auto Entry = Result.ContextSources->try_emplace(IGN.URI).first;
+      Entry->getValue() = std::move(IGN);
+      Entry->getValue().URI = Entry->getKey();
+      for (auto &Include : Entry->getValue().DirectIncludes)
+        Include = Result.ContextSources->try_emplace(Include).first->getKey();
+    }
+    if (ContextReader.err())
+      return error("malformed or truncated context include graph");
+  }
+
   if (Chunks.count("symb")) {
     Reader SymbolReader(Chunks.lookup("symb"));
     SymbolSlab::Builder Symbols;
@@ -583,6 +602,13 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
       visitStrings(Sources.back(),
                    [&](llvm::StringRef &S) { Strings.intern(S); });
     }
+  std::vector<IncludeGraphNode> ContextSources;
+  if (Data.ContextSources)
+    for (const auto &Source : *Data.ContextSources) {
+      ContextSources.push_back(Source.getValue());
+      visitStrings(ContextSources.back(),
+                   [&](llvm::StringRef &S) { Strings.intern(S); });
+    }
 
   std::vector<std::pair<SymbolID, std::vector<Ref>>> Refs;
   if (Data.Refs) {
@@ -652,12 +678,21 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
 
   std::string SrcsSection;
   {
+    llvm::raw_string_ostream SrcsOS(SrcsSection);
+    for (const auto &SF : Sources)
+      writeIncludeGraphNode(SF, Strings, SrcsOS);
+  }
+  RIFF.Chunks.push_back({riff::fourCC("srcs"), SrcsSection});
+
+  std::string ContextSection;
+  if (Data.ContextSources) {
     {
-      llvm::raw_string_ostream SrcsOS(SrcsSection);
-      for (const auto &SF : Sources)
-        writeIncludeGraphNode(SF, Strings, SrcsOS);
+      llvm::raw_string_ostream ContextOS(ContextSection);
+      write32(/*ContextSchema=*/1, ContextOS);
+      for (const auto &Source : ContextSources)
+        writeIncludeGraphNode(Source, Strings, ContextOS);
     }
-    RIFF.Chunks.push_back({riff::fourCC("srcs"), SrcsSection});
+    RIFF.Chunks.push_back({riff::fourCC("ctxs"), ContextSection});
   }
 
   std::string CmdlSection;

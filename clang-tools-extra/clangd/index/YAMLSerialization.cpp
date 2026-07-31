@@ -45,6 +45,7 @@ struct VariantEntry {
   std::optional<RefBundle> Refs;
   std::optional<clang::clangd::Relation> Relation;
   std::optional<clang::clangd::IncludeGraphNode> Source;
+  std::optional<clang::clangd::IncludeGraphNode> ContextSource;
   std::optional<clang::tooling::CompileCommand> Cmd;
 };
 // A class helps YAML to serialize the 32-bit encoded position (Line&Column),
@@ -422,6 +423,10 @@ template <> struct MappingTraits<VariantEntry> {
       if (!IO.outputting())
         Variant.Source.emplace();
       MappingTraits<IncludeGraphNode>::mapping(IO, *Variant.Source);
+    } else if (IO.mapTag("!ContextSource", Variant.ContextSource.has_value())) {
+      if (!IO.outputting())
+        Variant.ContextSource.emplace();
+      MappingTraits<IncludeGraphNode>::mapping(IO, *Variant.ContextSource);
     } else if (IO.mapTag("!Cmd", Variant.Cmd.has_value())) {
       if (!IO.outputting())
         Variant.Cmd.emplace();
@@ -463,6 +468,13 @@ void writeYAML(const IndexFileOut &O, llvm::raw_ostream &OS) {
       Yout << Entry;
     }
   }
+  if (O.ContextSources) {
+    for (const auto &Source : *O.ContextSources) {
+      VariantEntry Entry;
+      Entry.ContextSource = Source.getValue();
+      Yout << Entry;
+    }
+  }
   if (O.Cmd) {
     VariantEntry Entry;
     Entry.Cmd = *O.Cmd;
@@ -480,6 +492,7 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
   llvm::UniqueStringSaver Strings(Arena);
   llvm::yaml::Input Yin(Data, &Strings);
   IncludeGraph Sources;
+  IncludeGraph ContextSources;
   std::optional<tooling::CompileCommand> Cmd;
   while (Yin.setCurrentDocument()) {
     llvm::yaml::EmptyContext Ctx;
@@ -506,6 +519,14 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
       for (auto &Include : Entry->getValue().DirectIncludes)
         Include = Sources.try_emplace(Include).first->getKey();
     }
+    if (Variant.ContextSource) {
+      auto &IGN = *Variant.ContextSource;
+      auto Entry = ContextSources.try_emplace(IGN.URI).first;
+      Entry->getValue() = std::move(IGN);
+      Entry->getValue().URI = Entry->getKey();
+      for (auto &Include : Entry->getValue().DirectIncludes)
+        Include = ContextSources.try_emplace(Include).first->getKey();
+    }
     if (Variant.Cmd)
       Cmd = *Variant.Cmd;
     Yin.nextDocument();
@@ -517,6 +538,8 @@ llvm::Expected<IndexFileIn> readYAML(llvm::StringRef Data,
   Result.Relations.emplace(std::move(Relations).build());
   if (Sources.size())
     Result.Sources = std::move(Sources);
+  if (ContextSources.size())
+    Result.ContextSources = std::move(ContextSources);
   Result.Cmd = std::move(Cmd);
   return std::move(Result);
 }

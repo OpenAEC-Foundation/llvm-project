@@ -292,6 +292,9 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
       ImportInsertions(Opts.ImportInsertions),
       PublishInactiveRegions(Opts.PublishInactiveRegions),
       WorkspaceRoot(Opts.WorkspaceRoot),
+      FileRenameWorkspace(
+          WorkspaceRoot ? std::make_unique<WorkspaceSourceCache>(*WorkspaceRoot)
+                        : nullptr),
       Transient(Opts.ImplicitCancellation ? TUScheduler::InvalidateOnUpdate
                                           : TUScheduler::NoInvalidation),
       DirtyFS(std::make_unique<DraftStoreFS>(TFS, DraftMgr)),
@@ -364,6 +367,8 @@ ClangdServer::~ClangdServer() {
 void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
                                llvm::StringRef Version,
                                WantDiagnostics WantDiags, bool ForceRebuild) {
+  if (FileRenameWorkspace)
+    FileRenameWorkspace->invalidate(File);
   std::string ActualVersion = DraftMgr.addDraft(File, Version, Contents);
   ParseOptions Opts;
   Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
@@ -482,6 +487,8 @@ ClangdServer::createConfiguredContextProvider(const config::Provider *Provider,
 }
 
 void ClangdServer::removeDocument(PathRef File) {
+  if (FileRenameWorkspace)
+    FileRenameWorkspace->invalidate(File);
   DraftMgr.removeDraft(File);
   WorkScheduler->remove(File);
 }
@@ -729,9 +736,10 @@ void ClangdServer::prepareFileRename(
         auto Drafts = DraftMgr.getDrafts();
         FrozenDraftFS SnapshotFS(TFS, Drafts);
         auto FS = SnapshotFS.view(std::nullopt);
-        auto WorkspaceFiles = workspaceSourceFiles(*WorkspaceRoot, *FS);
-        if (!WorkspaceFiles)
-          return CB(WorkspaceFiles.takeError());
+        auto Workspace = FileRenameWorkspace->snapshot(*FS);
+        if (!Workspace)
+          return CB(Workspace.takeError());
+        const auto &WorkspaceFiles = Workspace->Sources;
         auto Mappings = expandFileRenames(Renames, *WorkspaceRoot, *FS);
         if (!Mappings)
           return CB(Mappings.takeError());
@@ -744,7 +752,7 @@ void ClangdServer::prepareFileRename(
         // Every standalone source must trigger project discovery. The CDB
         // broadcaster is asynchronous, so wait for it before waiting for the
         // indexing work that its notification creates.
-        for (const WorkspaceSourceFile &File : *WorkspaceFiles)
+        for (const WorkspaceSourceFile &File : WorkspaceFiles)
           if (!File.IsHeader)
             (void)CDB.getCompileCommand(File.File);
         if (!CDB.blockUntilIdle(timeoutSeconds(30)))
@@ -764,7 +772,7 @@ void ClangdServer::prepareFileRename(
         llvm::StringSet<> TranslationUnits;
         for (PathRef TU : Graph->TranslationUnits)
           TranslationUnits.insert(TU);
-        for (const WorkspaceSourceFile &File : *WorkspaceFiles) {
+        for (const WorkspaceSourceFile &File : WorkspaceFiles) {
           bool Represented = File.IsHeader
                                  ? llvm::any_of(Graph->Files,
                                                 [&](const auto &N) {
@@ -800,6 +808,31 @@ void ClangdServer::prepareFileRename(
                 error("background index contains errors for {0}", Node.File));
         }
 
+        // Every represented closed file contributes to the proof, even when
+        // its old graph had no includes and it would not otherwise become an
+        // edit candidate.
+        llvm::StringMap<FileDigest> IndexedDigests;
+        for (const auto &Node : Graph->Files) {
+          if (!InWorkspace(Node.File) || findDraft(Drafts, Node.File))
+            continue;
+          auto [It, Inserted] =
+              IndexedDigests.try_emplace(Node.File, Node.Digest);
+          if (!Inserted && It->getValue() != Node.Digest)
+            return CB(error("background contexts disagree on the digest for "
+                            "{0}",
+                            Node.File));
+        }
+        for (const auto &Entry : IndexedDigests) {
+          auto Current = Workspace->Digests.find(Entry.first());
+          if (Current == Workspace->Digests.end())
+            return CB(error("indexed workspace file is missing from the "
+                            "workspace inventory: {0}",
+                            Entry.first()));
+          if (Current->getValue() != Entry.getValue())
+            return CB(error("background include graph is stale for {0}",
+                            Entry.first()));
+        }
+
         auto IsRenamed = [&](PathRef File) -> llvm::Expected<bool> {
           auto S = FS->status(File);
           if (!S)
@@ -812,6 +845,7 @@ void ClangdServer::prepareFileRename(
 
         llvm::StringMap<std::vector<const BackgroundIndex::IndexedFile *>>
             Candidates;
+        llvm::StringSet<> ActiveCandidates;
         for (const auto &Node : Graph->Files) {
           if (!InWorkspace(Node.File))
             continue;
@@ -826,7 +860,20 @@ void ClangdServer::prepareFileRename(
               return CB(IncludedAffected.takeError());
             *Affected = *IncludedAffected;
           }
-          if (*Affected || Node.HasConditionalIncludes)
+          bool HasLiteralConditionalInclude = false;
+          if (Node.HasConditionalIncludes) {
+            auto Conditional = conditionalIncludeDirectives(Node.File, *FS);
+            if (!Conditional)
+              return CB(Conditional.takeError());
+            HasLiteralConditionalInclude =
+                llvm::any_of(*Conditional, [](const auto &Inclusion) {
+                  return !Inclusion.Written.empty() &&
+                         Inclusion.Directive != tok::pp_include_next;
+                });
+          }
+          if (*Affected)
+            ActiveCandidates.insert(Node.File);
+          if (*Affected || HasLiteralConditionalInclude)
             Candidates[Node.File].push_back(&Node);
         }
 
@@ -873,6 +920,11 @@ void ClangdServer::prepareFileRename(
           auto Conditional = conditionalIncludeDirectives(File, *FS);
           if (!Conditional)
             return CB(Conditional.takeError());
+          if (!ActiveCandidates.contains(File))
+            llvm::erase_if(*Conditional, [](const auto &Inclusion) {
+              return Inclusion.Written.empty() ||
+                     Inclusion.Directive == tok::pp_include_next;
+            });
           ConditionalIncludes[File] = std::move(*Conditional);
           for (const auto *Context : Candidate.getValue())
             if (!findDraft(Drafts, File) &&
@@ -1057,6 +1109,11 @@ void ClangdServer::prepareFileRename(
 
 void ClangdServer::didRenameFiles(
     llvm::ArrayRef<std::pair<Path, Path>> Renames) {
+  if (FileRenameWorkspace)
+    for (const auto &[OldPath, NewPath] : Renames) {
+      FileRenameWorkspace->invalidate(OldPath);
+      FileRenameWorkspace->invalidate(NewPath);
+    }
   struct MovedDraft {
     Path OldPath;
     Path NewPath;
@@ -1391,8 +1448,10 @@ void ClangdServer::outgoingCalls(
 }
 
 void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
-  // FIXME: Do nothing for now. This will be used for indexing and potentially
-  // invalidating other caches.
+  if (!FileRenameWorkspace)
+    return;
+  for (const FileEvent &Change : Params.changes)
+    FileRenameWorkspace->invalidate(Change.uri.file());
 }
 
 void ClangdServer::workspaceSymbols(

@@ -39,6 +39,8 @@ int open_file() { return 0; }
 ---
 {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://DIRECTORY/open.cpp","languageId":"cpp","version":1,"text":"#include \"old.h\"\nint open_file() { return answer(); }\n"}}}
 ---
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://DIRECTORY/old.h","languageId":"cpp","version":2,"text":"inline int answer() { return 42; }\n"}}}
+---
 {"jsonrpc":"2.0","id":1,"method":"workspace/willRenameFiles","params":{"files":[{"oldUri":"file://DIRECTORY/old.h","newUri":"file://DIRECTORY/new.h"}]}}
 # CHECK:      "id": 1,
 # CHECK-NEXT: "jsonrpc": "2.0",
@@ -52,6 +54,11 @@ int open_file() { return 0; }
 ---
 {"jsonrpc":"2.0","method":"workspace/didRenameFiles","params":{"files":[{"oldUri":"file://DIRECTORY/old.h","newUri":"file://DIRECTORY/new.h"}]}}
 ---
-{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file://DIRECTORY/new.h"}}}
+# CHECK:      "id": 2,
+# CHECK-NEXT: "jsonrpc": "2.0",
+# CHECK:      "name": "answer"
+---
+{"jsonrpc":"2.0","id":3,"method":"shutdown"}
 ---
 {"jsonrpc":"2.0","method":"exit"}

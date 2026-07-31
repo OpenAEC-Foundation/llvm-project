@@ -10,14 +10,16 @@
 #include "Config.h"
 #include "SourceCode.h"
 #include "support/Logger.h"
-#include "clang/Driver/Types.h"
 #include "clang/Lex/DependencyDirectivesScanner.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Options/Options.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Option/ArgList.h"
+#include "llvm/Option/Option.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -449,48 +451,6 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
   return Result;
 }
 
-llvm::Expected<std::vector<WorkspaceSourceFile>>
-workspaceSourceFiles(PathRef WorkspaceRoot, llvm::vfs::FileSystem &FS) {
-  auto Root = normalizeAbsolute(WorkspaceRoot);
-  if (!Root)
-    return Root.takeError();
-  auto CanonicalRoot = canonicalPath(*Root, FS);
-  if (!CanonicalRoot)
-    return CanonicalRoot.takeError();
-  std::error_code EC;
-  llvm::vfs::recursive_directory_iterator It(FS, *Root, EC), End;
-  if (EC)
-    return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
-  std::vector<WorkspaceSourceFile> Result;
-  for (; It != End; It.increment(EC)) {
-    if (EC)
-      return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
-    auto S = FS.status(It->path());
-    if (!S)
-      return error("cannot inspect workspace entry {0}: {1}", It->path(),
-                   S.getError().message());
-    if (!S->isRegularFile())
-      continue;
-    namespace types = clang::driver::types;
-    types::ID Type = types::lookupTypeForExtension(
-        llvm::sys::path::extension(It->path()).drop_front());
-    if (Type == types::TY_INVALID ||
-        (!types::isSrcFile(Type) && !types::onlyPrecompileType(Type)))
-      continue;
-    auto Real = canonicalPath(It->path(), FS);
-    if (!Real)
-      return Real.takeError();
-    if (!pathInsideExact(*CanonicalRoot, *Real))
-      return error("workspace source traverses outside the workspace: {0}",
-                   It->path());
-    Result.push_back(
-        {It->path().str(), /*IsHeader=*/types::onlyPrecompileType(Type)});
-  }
-  if (EC)
-    return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
-  return Result;
-}
-
 llvm::Expected<std::vector<ConditionalInclusion>>
 conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   auto Scan = scanDependencyDirectives(File, FS);
@@ -600,7 +560,7 @@ llvm::Error validateCompileCommandForRenames(
                        llvm::StringRef Option) -> llvm::Error {
     if (Value.empty())
       return error("compiler option {0} has an empty path", Option);
-    if (Option == "-fmodule-file") {
+    if (Option.starts_with("-fmodule-file")) {
       size_t Equals = Value.rfind('=');
       if (Equals != llvm::StringRef::npos)
         Value = Value.drop_front(Equals + 1);
@@ -647,78 +607,140 @@ llvm::Error validateCompileCommandForRenames(
   if (auto Err = CheckPath(Command.Directory, "compilation working directory"))
     return Err;
 
-  struct JoinedOption {
-    llvm::StringLiteral Prefix;
-    llvm::StringLiteral Name;
-  };
-  static constexpr JoinedOption Joined[] = {
-      {"--sysroot=", "--sysroot"},
-      {"--gcc-toolchain=", "--gcc-toolchain"},
-      {"-resource-dir=", "-resource-dir"},
-      {"-fmodule-map-file=", "-fmodule-map-file"},
-      {"-fmodule-file=", "-fmodule-file"},
-      {"-fprebuilt-module-path=", "-fprebuilt-module-path"},
-      {"-fmodules-cache-path=", "-fmodules-cache-path"},
-      {"-ivfsoverlay=", "-ivfsoverlay"},
-      {"-working-directory=", "-working-directory"},
-      {"-include-pch", "-include-pch"},
-      {"-include", "-include"},
-      {"-imacros", "-imacros"},
-      {"-iframeworkwithsysroot", "-iframeworkwithsysroot"},
-      {"-isystem", "-isystem"},
-      {"-iquote", "-iquote"},
-      {"-idirafter", "-idirafter"},
-      {"-isysroot", "-isysroot"},
-      {"-iframework", "-iframework"},
-      {"-I", "-I"},
-      {"-F", "-F"},
-  };
-  static const llvm::StringSet<> Separate = {
-      "-I",
-      "-F",
-      "-iquote",
-      "-isystem",
-      "-idirafter",
-      "-isysroot",
-      "--sysroot",
-      "-iframework",
-      "-iframeworkwithsysroot",
-      "--gcc-toolchain",
-      "-resource-dir",
-      "-include",
-      "-include-pch",
-      "-imacros",
-      "-fmodule-map-file",
-      "-fmodule-file",
-      "-fprebuilt-module-path",
-      "-fmodules-cache-path",
-      "-ivfsoverlay",
-      "-working-directory",
-  };
-  llvm::ArrayRef<std::string> Args = Command.CommandLine;
-  for (size_t I = 1; I < Args.size(); ++I) {
-    llvm::StringRef Arg = Args[I];
+  if (Command.CommandLine.empty())
+    return error("compiler command line is empty");
+
+  llvm::ArrayRef<std::string> CommandArgs = Command.CommandLine;
+  for (llvm::StringRef Arg : CommandArgs.drop_front()) {
     if (Arg.starts_with("@"))
       return error(
           "cannot prove compiler response file paths after rename: {0}", Arg);
-    if (Separate.contains(Arg)) {
-      if (++I == Args.size())
-        return error("compiler option {0} has no path", Arg);
-      if (Args[I] == "-Xclang" && ++I == Args.size())
-        return error("compiler option {0} has no path", Arg);
-      if (auto Err = CheckPath(Args[I], Arg))
-        return Err;
-      continue;
-    }
-    for (const JoinedOption &Option : Joined) {
-      if (Arg.size() <= Option.Prefix.size() || !Arg.starts_with(Option.Prefix))
+  }
+
+  static constexpr unsigned PathOptions[] = {
+      options::OPT_I,
+      options::OPT_F,
+      options::OPT_embed_dir_EQ,
+      options::OPT_gcc_toolchain,
+      options::OPT__sysroot_EQ,
+      options::OPT_resource_dir,
+      options::OPT_resource_dir_EQ,
+      options::OPT_fmodule_map_file,
+      options::OPT_fmodule_file,
+      options::OPT_fprebuilt_module_path,
+      options::OPT_fmodules_cache_path,
+      options::OPT_fmodules_user_build_path,
+      options::OPT_include,
+      options::OPT_include_pch,
+      options::OPT_imacros,
+      options::OPT_iprefix,
+      options::OPT_iquote,
+      options::OPT_isysroot,
+      options::OPT_isystem,
+      options::OPT_isystem_after,
+      options::OPT_iwithprefix,
+      options::OPT_iwithprefixbefore,
+      options::OPT_iwithsysroot,
+      options::OPT_idirafter,
+      options::OPT_iframework,
+      options::OPT_iframeworkwithsysroot,
+      options::OPT_iapinotes_modules,
+      options::OPT_ivfsoverlay,
+      options::OPT_vfsoverlay,
+      options::OPT_working_directory,
+      options::OPT_working_directory_EQ,
+      options::OPT_c_isystem,
+      options::OPT_objc_isystem,
+      options::OPT_objcxx_isystem,
+      options::OPT_internal_iframework,
+      options::OPT_internal_isystem,
+      options::OPT_internal_externc_isystem,
+      options::OPT_chain_include,
+  };
+  auto ParseAndCheck = [&](llvm::ArrayRef<llvm::StringRef> Args,
+                           llvm::opt::Visibility Visibility) -> llvm::Error {
+    llvm::SmallVector<const char *> RawArgs;
+    RawArgs.reserve(Args.size());
+    for (llvm::StringRef Arg : Args)
+      RawArgs.push_back(Arg.data());
+    unsigned MissingIndex = 0;
+    unsigned MissingCount = 0;
+    llvm::opt::InputArgList Parsed = getDriverOptTable().ParseArgs(
+        RawArgs, MissingIndex, MissingCount, Visibility);
+    if (MissingCount)
+      return error("compiler option {0} has no path", Args[MissingIndex]);
+    llvm::StringRef Sysroot;
+    for (const llvm::opt::Arg *Arg : Parsed)
+      if (Arg->getOption().matches(options::OPT_isysroot) ||
+          Arg->getOption().matches(options::OPT__sysroot_EQ))
+        Sysroot = Arg->getValue();
+    llvm::StringRef IncludePrefix;
+    for (const llvm::opt::Arg *Arg : Parsed) {
+      if (!llvm::any_of(PathOptions, [&](unsigned ID) {
+            return Arg->getOption().matches(ID);
+          }))
         continue;
-      if (auto Err =
-              CheckPath(Arg.drop_front(Option.Prefix.size()), Option.Name))
+      if (Arg->getNumValues() != 1)
+        return error("compiler option {0} does not have exactly one path",
+                     Arg->getSpelling());
+      if (Arg->getOption().matches(options::OPT_iprefix)) {
+        IncludePrefix = Arg->getValue();
+        if (auto Err = CheckPath(IncludePrefix, Arg->getSpelling()))
+          return Err;
+        continue;
+      }
+      if (Arg->getOption().matches(options::OPT_iwithprefix) ||
+          Arg->getOption().matches(options::OPT_iwithprefixbefore)) {
+        std::string Composed = (IncludePrefix + Arg->getValue()).str();
+        if (auto Err = CheckPath(Composed, Arg->getSpelling()))
+          return Err;
+        continue;
+      }
+      if (!Sysroot.empty() &&
+          (Arg->getOption().matches(options::OPT_iwithsysroot) ||
+           Arg->getOption().matches(options::OPT_iframeworkwithsysroot)) &&
+          llvm::sys::path::is_absolute(Arg->getValue())) {
+        if (auto Err = CheckPath((Sysroot + Arg->getValue()).str(),
+                                 Arg->getSpelling()))
+          return Err;
+        continue;
+      }
+      bool ExpandsEqualsPath =
+          Arg->getOption().matches(options::OPT_I) ||
+          Arg->getOption().matches(options::OPT_idirafter) ||
+          Arg->getOption().matches(options::OPT_iquote) ||
+          Arg->getOption().matches(options::OPT_isystem);
+      llvm::StringRef Value = Arg->getValue();
+      if (!Sysroot.empty() && ExpandsEqualsPath && Value.starts_with("=")) {
+        llvm::SmallString<256> Expanded(Sysroot);
+        llvm::sys::path::append(Expanded, Value.drop_front());
+        if (auto Err = CheckPath(Expanded, Arg->getSpelling()))
+          return Err;
+        continue;
+      }
+      if (auto Err = CheckPath(Arg->getValue(), Arg->getSpelling()))
         return Err;
-      break;
+    }
+    return llvm::Error::success();
+  };
+
+  llvm::SmallVector<llvm::StringRef> DriverArgs;
+  llvm::SmallVector<llvm::StringRef> CC1Args;
+  for (size_t I = 1; I < CommandArgs.size(); ++I) {
+    if (CommandArgs[I] == "-Xclang") {
+      if (++I == CommandArgs.size())
+        return error("compiler option -Xclang has no argument");
+      CC1Args.push_back(CommandArgs[I]);
+    } else {
+      DriverArgs.push_back(CommandArgs[I]);
     }
   }
+  if (auto Err = ParseAndCheck(DriverArgs,
+                               llvm::opt::Visibility(options::ClangOption)))
+    return Err;
+  if (auto Err =
+          ParseAndCheck(CC1Args, llvm::opt::Visibility(options::CC1Option)))
+    return Err;
   return llvm::Error::success();
 }
 
