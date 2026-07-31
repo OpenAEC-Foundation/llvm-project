@@ -65,6 +65,7 @@ BackgroundIndexLoader::loadShard(PathRef StartSourceFile, PathRef DependentTU) {
   }
 
   LS.Shard = std::move(Shard);
+  bool FoundSource = false;
   for (const auto &It : *LS.Shard->Sources) {
     auto AbsPath = URI::resolve(It.getKey(), StartSourceFile);
     if (!AbsPath) {
@@ -78,12 +79,19 @@ BackgroundIndexLoader::loadShard(PathRef StartSourceFile, PathRef DependentTU) {
     }
 
     // Fill in shard metadata.
+    FoundSource = true;
     const IncludeGraphNode &IGN = It.getValue();
     LS.Digest = IGN.Digest;
     LS.CountReferences = IGN.Flags & IncludeGraphNode::SourceFlag::IsTU;
     LS.HadErrors = IGN.Flags & IncludeGraphNode::SourceFlag::HadErrors;
   }
-  assert(LS.Digest != FileDigest{{0}} && "Digest is empty?");
+  if (!FoundSource || LS.Digest == FileDigest{{0}}) {
+    vlog("Ignoring malformed shard without source metadata: {0}",
+         StartSourceFile);
+    LS.Shard.reset();
+    LS.Digest = {};
+    Edges.clear();
+  }
   return {LS, Edges};
 }
 

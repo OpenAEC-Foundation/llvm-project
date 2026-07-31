@@ -10,6 +10,8 @@
 #include "Config.h"
 #include "SourceCode.h"
 #include "support/Logger.h"
+#include "clang/Driver/Types.h"
+#include "clang/Lex/DependencyDirectivesScanner.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -17,6 +19,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include <optional>
 #include <system_error>
@@ -34,8 +37,66 @@ llvm::Expected<Path> normalizeAbsolute(PathRef Path) {
   return Normalized.str().str();
 }
 
-llvm::Error checkInsideWorkspace(PathRef Path, PathRef WorkspaceRoot) {
-  if (!pathEqual(Path, WorkspaceRoot) && !pathStartsWith(WorkspaceRoot, Path))
+struct ScannedDependencyDirectives {
+  std::unique_ptr<llvm::MemoryBuffer> Buffer;
+  llvm::SmallVector<dependency_directives_scan::Token> Tokens;
+  llvm::SmallVector<dependency_directives_scan::Directive> Directives;
+};
+
+llvm::Expected<std::unique_ptr<ScannedDependencyDirectives>>
+scanDependencyDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
+  auto Buffer = FS.getBufferForFile(File);
+  if (!Buffer)
+    return error("cannot read dependency directives from {0}: {1}", File,
+                 Buffer.getError().message());
+  auto Result = std::make_unique<ScannedDependencyDirectives>();
+  Result->Buffer = std::move(*Buffer);
+  if (scanSourceForDependencyDirectives(Result->Buffer->getBuffer(),
+                                        Result->Tokens, Result->Directives))
+    return error("cannot scan dependency directives in {0}", File);
+  return Result;
+}
+
+bool pathInsideExact(PathRef Ancestor, PathRef Path) {
+  if (Ancestor == Path)
+    return true;
+  if (!Path.starts_with(Ancestor))
+    return false;
+  return Path.size() > Ancestor.size() &&
+         llvm::sys::path::is_separator(Path[Ancestor.size()]);
+}
+
+llvm::Expected<Path> canonicalPath(PathRef Path, llvm::vfs::FileSystem &FS) {
+  llvm::SmallString<256> Existing(Path);
+  llvm::SmallVector<llvm::StringRef> MissingComponents;
+  while (true) {
+    if (auto S = FS.status(Existing)) {
+      llvm::SmallString<256> Real;
+      if (std::error_code EC = FS.getRealPath(Existing, Real))
+        return error("cannot resolve real path {0}: {1}", Existing,
+                     EC.message());
+      for (llvm::StringRef Component : llvm::reverse(MissingComponents))
+        llvm::sys::path::append(Real, Component);
+      llvm::sys::path::remove_dots(Real, /*remove_dot_dot=*/true);
+      return Real.str().str();
+    } else if (S.getError() != std::errc::no_such_file_or_directory) {
+      return error("cannot inspect path {0}: {1}", Existing,
+                   S.getError().message());
+    }
+    llvm::StringRef Filename = llvm::sys::path::filename(Existing);
+    if (Filename.empty())
+      return error("cannot find an existing ancestor of {0}", Path);
+    MissingComponents.push_back(Filename);
+    llvm::sys::path::remove_filename(Existing);
+  }
+}
+
+llvm::Error checkInsideWorkspace(PathRef Path, PathRef CanonicalWorkspaceRoot,
+                                 llvm::vfs::FileSystem &FS) {
+  auto Real = canonicalPath(Path, FS);
+  if (!Real)
+    return Real.takeError();
+  if (!pathInsideExact(CanonicalWorkspaceRoot, *Real))
     return error("file rename path is outside the workspace: {0}", Path);
   return llvm::Error::success();
 }
@@ -53,7 +114,13 @@ llvm::Error checkDestination(PathRef OldPath, PathRef NewPath,
                              const llvm::vfs::Status &OldStatus,
                              llvm::vfs::FileSystem &FS) {
   if (auto Existing = FS.status(NewPath)) {
-    if (!pathEqual(OldPath, NewPath) ||
+    auto RealOld = canonicalPath(OldPath, FS);
+    if (!RealOld)
+      return RealOld.takeError();
+    auto RealNew = canonicalPath(NewPath, FS);
+    if (!RealNew)
+      return RealNew.takeError();
+    if (*RealOld != *RealNew ||
         Existing->getUniqueID() != OldStatus.getUniqueID())
       return error("rename destination already exists: {0}", NewPath);
   } else if (Existing.getError() != std::errc::no_such_file_or_directory) {
@@ -61,6 +128,51 @@ llvm::Error checkDestination(PathRef OldPath, PathRef NewPath,
                  Existing.getError().message());
   }
   return llvm::Error::success();
+}
+
+llvm::Expected<bool> caseSensitiveAt(PathRef Path, llvm::vfs::FileSystem &FS) {
+  llvm::SmallString<256> Existing(llvm::sys::path::parent_path(Path));
+  while (!Existing.empty()) {
+    if (auto S = FS.status(Existing))
+      break;
+    else if (S.getError() != std::errc::no_such_file_or_directory)
+      return error("cannot inspect destination parent {0}: {1}", Existing,
+                   S.getError().message());
+    llvm::sys::path::remove_filename(Existing);
+  }
+  while (!Existing.empty()) {
+    llvm::StringRef Name = llvm::sys::path::filename(Existing);
+    std::string Changed = Name.str();
+    auto Letter =
+        llvm::find_if(Changed, [](char C) { return llvm::isAlpha(C); });
+    if (Letter != Changed.end()) {
+      *Letter = llvm::isLower(*Letter) ? llvm::toUpper(*Letter)
+                                       : llvm::toLower(*Letter);
+      llvm::SmallString<256> Probe(llvm::sys::path::parent_path(Existing));
+      llvm::sys::path::append(Probe, Changed);
+      auto Original = FS.status(Existing);
+      if (!Original)
+        return error("cannot inspect destination parent {0}: {1}", Existing,
+                     Original.getError().message());
+      auto Alternate = FS.status(Probe);
+      if (Alternate)
+        return Alternate->getUniqueID() != Original->getUniqueID();
+      if (Alternate.getError() == std::errc::no_such_file_or_directory)
+        return true;
+      return error("cannot probe filesystem case behavior at {0}: {1}", Probe,
+                   Alternate.getError().message());
+    }
+    llvm::sys::path::remove_filename(Existing);
+  }
+  return error("cannot determine filesystem case behavior for {0}", Path);
+}
+
+llvm::Expected<std::string> destinationKey(PathRef Path,
+                                           llvm::vfs::FileSystem &FS) {
+  auto Sensitive = caseSensitiveAt(Path, FS);
+  if (!Sensitive)
+    return Sensitive.takeError();
+  return *Sensitive ? Path.str() : Path.lower();
 }
 
 llvm::Error
@@ -80,19 +192,27 @@ addMapping(Path OldPath, Path NewPath, llvm::vfs::FileSystem &FS,
   auto ExistingIdentity = ByIdentity.find(OldStatus->getUniqueID());
   if (ExistingIdentity != ByIdentity.end()) {
     const auto &Previous = Result[ExistingIdentity->second];
-    if (!pathEqual(Previous.NewPath, NewPath))
+    auto PreviousKey = destinationKey(Previous.NewPath, FS);
+    if (!PreviousKey)
+      return PreviousKey.takeError();
+    auto NewKey = destinationKey(NewPath, FS);
+    if (!NewKey)
+      return NewKey.takeError();
+    if (*PreviousKey != *NewKey)
       return error("the same file is renamed to both {0} and {1}",
                    Previous.NewPath, NewPath);
     return llvm::Error::success();
   }
 
-  std::string DestinationKey = maybeCaseFoldPath(NewPath);
-  if (auto ExistingDestination = ByDestination.find(DestinationKey);
+  auto DestinationKey = destinationKey(NewPath, FS);
+  if (!DestinationKey)
+    return DestinationKey.takeError();
+  if (auto ExistingDestination = ByDestination.find(*DestinationKey);
       ExistingDestination != ByDestination.end())
     return error("multiple files are renamed to {0}", NewPath);
 
   ByIdentity[OldStatus->getUniqueID()] = Result.size();
-  ByDestination[DestinationKey] = Result.size();
+  ByDestination[*DestinationKey] = Result.size();
   Result.push_back(
       {std::move(OldPath), std::move(NewPath), OldStatus->getUniqueID()});
   return llvm::Error::success();
@@ -165,7 +285,7 @@ llvm::Error verifyNewIncludeResolution(llvm::StringRef Written,
     llvm::SmallString<256> Candidate(Directory);
     llvm::sys::path::append(Candidate, Name);
     llvm::sys::path::remove_dots(Candidate, /*remove_dot_dot=*/true);
-    if (pathEqual(Candidate, NewTarget))
+    if (Candidate == NewTarget)
       return true;
     if (auto Existing = FS.status(Candidate)) {
       if (Existing->isRegularFile())
@@ -209,8 +329,8 @@ std::optional<std::string> relativeIncludePath(PathRef IncludingFile,
   llvm::SmallString<256> Destination(Target);
   llvm::sys::path::remove_dots(Base, /*remove_dot_dot=*/true);
   llvm::sys::path::remove_dots(Destination, /*remove_dot_dot=*/true);
-  if (!pathEqual(llvm::sys::path::root_name(Base),
-                 llvm::sys::path::root_name(Destination)) ||
+  if (llvm::sys::path::root_name(Base) !=
+          llvm::sys::path::root_name(Destination) ||
       llvm::sys::path::has_root_directory(Base) !=
           llvm::sys::path::has_root_directory(Destination))
     return std::nullopt;
@@ -220,7 +340,7 @@ std::optional<std::string> relativeIncludePath(PathRef IncludingFile,
   auto DestinationIt = llvm::sys::path::begin(Destination);
   auto DestinationEnd = llvm::sys::path::end(Destination);
   while (BaseIt != BaseEnd && DestinationIt != DestinationEnd &&
-         pathEqual(*BaseIt, *DestinationIt)) {
+         *BaseIt == *DestinationIt) {
     ++BaseIt;
     ++DestinationIt;
   }
@@ -248,6 +368,9 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
   auto NormalizedRoot = normalizeAbsolute(WorkspaceRoot);
   if (!NormalizedRoot)
     return NormalizedRoot.takeError();
+  auto CanonicalRoot = canonicalPath(*NormalizedRoot, FS);
+  if (!CanonicalRoot)
+    return CanonicalRoot.takeError();
 
   std::vector<FileRenameMapping> Result;
   llvm::DenseMap<llvm::sys::fs::UniqueID, size_t> ByIdentity;
@@ -259,9 +382,9 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
     auto New = normalizeAbsolute(RawNew);
     if (!New)
       return New.takeError();
-    if (auto Err = checkInsideWorkspace(*Old, *NormalizedRoot))
+    if (auto Err = checkInsideWorkspace(*Old, *CanonicalRoot, FS))
       return std::move(Err);
-    if (auto Err = checkInsideWorkspace(*New, *NormalizedRoot))
+    if (auto Err = checkInsideWorkspace(*New, *CanonicalRoot, FS))
       return std::move(Err);
     if (*Old == *New)
       return error("rename source and destination are identical: {0}", *Old);
@@ -277,7 +400,13 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
     }
     if (!OldStatus->isDirectory())
       return error("rename source is neither a file nor directory: {0}", *Old);
-    if (pathStartsWith(*Old, *New))
+    auto CanonicalOld = canonicalPath(*Old, FS);
+    if (!CanonicalOld)
+      return CanonicalOld.takeError();
+    auto CanonicalNew = canonicalPath(*New, FS);
+    if (!CanonicalNew)
+      return CanonicalNew.takeError();
+    if (pathInsideExact(*CanonicalOld, *CanonicalNew))
       return error("rename destination is inside its source directory: {0}",
                    *New);
     if (auto Err = checkDestination(*Old, *New, *OldStatus, FS))
@@ -320,6 +449,295 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
   return Result;
 }
 
+llvm::Expected<std::vector<WorkspaceSourceFile>>
+workspaceSourceFiles(PathRef WorkspaceRoot, llvm::vfs::FileSystem &FS) {
+  auto Root = normalizeAbsolute(WorkspaceRoot);
+  if (!Root)
+    return Root.takeError();
+  auto CanonicalRoot = canonicalPath(*Root, FS);
+  if (!CanonicalRoot)
+    return CanonicalRoot.takeError();
+  std::error_code EC;
+  llvm::vfs::recursive_directory_iterator It(FS, *Root, EC), End;
+  if (EC)
+    return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
+  std::vector<WorkspaceSourceFile> Result;
+  for (; It != End; It.increment(EC)) {
+    if (EC)
+      return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
+    auto S = FS.status(It->path());
+    if (!S)
+      return error("cannot inspect workspace entry {0}: {1}", It->path(),
+                   S.getError().message());
+    if (!S->isRegularFile())
+      continue;
+    namespace types = clang::driver::types;
+    types::ID Type = types::lookupTypeForExtension(
+        llvm::sys::path::extension(It->path()).drop_front());
+    if (Type == types::TY_INVALID ||
+        (!types::isSrcFile(Type) && !types::onlyPrecompileType(Type)))
+      continue;
+    auto Real = canonicalPath(It->path(), FS);
+    if (!Real)
+      return Real.takeError();
+    if (!pathInsideExact(*CanonicalRoot, *Real))
+      return error("workspace source traverses outside the workspace: {0}",
+                   It->path());
+    Result.push_back(
+        {It->path().str(), /*IsHeader=*/types::onlyPrecompileType(Type)});
+  }
+  if (EC)
+    return error("cannot enumerate workspace {0}: {1}", *Root, EC.message());
+  return Result;
+}
+
+llvm::Expected<std::vector<ConditionalInclusion>>
+conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
+  auto Scan = scanDependencyDirectives(File, FS);
+  if (!Scan)
+    return Scan.takeError();
+  const auto &Directives = (*Scan)->Directives;
+  llvm::StringRef Code = (*Scan)->Buffer->getBuffer();
+  auto MacroName = [&](const dependency_directives_scan::Directive &Directive) {
+    unsigned RawIdentifiers = 0;
+    for (const auto &Token : Directive.Tokens)
+      if (Token.Kind == tok::raw_identifier && ++RawIdentifiers == 2)
+        return Code.slice(Token.Offset, Token.getEnd());
+    return llvm::StringRef();
+  };
+  size_t First = 0;
+  while (First < Directives.size() &&
+         Directives[First].Kind == dependency_directives_scan::pp_pragma_once)
+    ++First;
+  size_t Last = Directives.size();
+  while (Last > First &&
+         (Directives[Last - 1].Kind == dependency_directives_scan::pp_eof ||
+          Directives[Last - 1].Kind ==
+              dependency_directives_scan::tokens_present_before_eof))
+    --Last;
+  bool HasIncludeGuard =
+      First + 2 < Last &&
+      Directives[First].Kind == dependency_directives_scan::pp_ifndef &&
+      Directives[First + 1].Kind == dependency_directives_scan::pp_define &&
+      Directives[Last - 1].Kind == dependency_directives_scan::pp_endif &&
+      !MacroName(Directives[First]).empty() &&
+      MacroName(Directives[First]) == MacroName(Directives[First + 1]);
+
+  std::vector<ConditionalInclusion> Result;
+  unsigned ConditionalDepth = 0;
+  bool InGuardAlternative = false;
+  for (const auto &Directive : Directives) {
+    using namespace dependency_directives_scan;
+    switch (Directive.Kind) {
+    case pp_if:
+    case pp_ifdef:
+    case pp_ifndef:
+      ++ConditionalDepth;
+      break;
+    case pp_endif:
+      if (ConditionalDepth == 0)
+        return error("unbalanced preprocessor conditional in {0}", File);
+      --ConditionalDepth;
+      if (HasIncludeGuard && ConditionalDepth == 0)
+        InGuardAlternative = false;
+      break;
+    case pp_elif:
+    case pp_elifdef:
+    case pp_elifndef:
+    case pp_else:
+      if (HasIncludeGuard && ConditionalDepth == 1)
+        InGuardAlternative = true;
+      break;
+    case pp_include:
+    case pp_include_next:
+    case pp_import:
+      if (ConditionalDepth > (HasIncludeGuard ? 1u : 0u) ||
+          InGuardAlternative) {
+        ConditionalInclusion Inclusion;
+        Inclusion.Directive = Directive.Kind == pp_include ? tok::pp_include
+                              : Directive.Kind == pp_include_next
+                                  ? tok::pp_include_next
+                                  : tok::pp_import;
+        for (const auto &Token : Directive.Tokens) {
+          if (Token.Kind == tok::hash)
+            Inclusion.HashOffset = Token.Offset;
+          if (Token.Kind == tok::header_name)
+            Inclusion.Written = Code.slice(Token.Offset, Token.getEnd()).str();
+        }
+        Inclusion.HashLine = offsetToPosition(Code, Inclusion.HashOffset).line;
+        Result.push_back(std::move(Inclusion));
+      }
+      break;
+    default:
+      break;
+    }
+  }
+  if (ConditionalDepth != 0)
+    return error("unbalanced preprocessor conditional in {0}", File);
+  return Result;
+}
+
+llvm::Expected<bool> hasIncludeDirectives(PathRef File,
+                                          llvm::vfs::FileSystem &FS) {
+  auto Scan = scanDependencyDirectives(File, FS);
+  if (!Scan)
+    return Scan.takeError();
+  return llvm::any_of((*Scan)->Directives, [](const auto &Directive) {
+    using namespace dependency_directives_scan;
+    return Directive.Kind == pp_include || Directive.Kind == pp_include_next ||
+           Directive.Kind == pp_import;
+  });
+}
+
+llvm::Error validateCompileCommandForRenames(
+    const tooling::CompileCommand &Command,
+    llvm::ArrayRef<std::pair<Path, Path>> Renames,
+    llvm::ArrayRef<FileRenameMapping> ExpandedRenames,
+    llvm::vfs::FileSystem *FS) {
+  assert(ExpandedRenames.empty() == (FS == nullptr) &&
+         "expanded renames and filesystem must be provided together");
+  auto CheckPath = [&](llvm::StringRef Value,
+                       llvm::StringRef Option) -> llvm::Error {
+    if (Value.empty())
+      return error("compiler option {0} has an empty path", Option);
+    if (Option == "-fmodule-file") {
+      size_t Equals = Value.rfind('=');
+      if (Equals != llvm::StringRef::npos)
+        Value = Value.drop_front(Equals + 1);
+    }
+    llvm::SmallString<256> Absolute(Value);
+    if (!llvm::sys::path::is_absolute(Absolute)) {
+      Absolute = Command.Directory;
+      llvm::sys::path::append(Absolute, Value);
+    }
+    llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
+    auto Mapped = mapPathAfterRenames(Absolute, Renames);
+    if (!Mapped)
+      return Mapped.takeError();
+    if (*Mapped != Absolute)
+      return error("file rename moves compiler path {0} from option {1}",
+                   Absolute, Option);
+    if (FS) {
+      auto Canonical = canonicalPath(Absolute, *FS);
+      if (!Canonical)
+        return Canonical.takeError();
+      for (const auto &Rename : Renames) {
+        auto CanonicalOld = canonicalPath(Rename.first, *FS);
+        if (!CanonicalOld)
+          return CanonicalOld.takeError();
+        if (pathInsideExact(*CanonicalOld, *Canonical))
+          return error("file rename moves compiler path {0} from option {1}",
+                       Absolute, Option);
+      }
+      auto S = FS->status(Absolute);
+      if (S) {
+        if (llvm::any_of(ExpandedRenames, [&](const auto &Rename) {
+              return Rename.OldIdentity == S->getUniqueID();
+            }))
+          return error("file rename moves compiler path {0} from option {1}",
+                       Absolute, Option);
+      } else if (S.getError() != std::errc::no_such_file_or_directory) {
+        return error("cannot inspect compiler path {0} from option {1}: {2}",
+                     Absolute, Option, S.getError().message());
+      }
+    }
+    return llvm::Error::success();
+  };
+
+  if (auto Err = CheckPath(Command.Directory, "compilation working directory"))
+    return Err;
+
+  struct JoinedOption {
+    llvm::StringLiteral Prefix;
+    llvm::StringLiteral Name;
+  };
+  static constexpr JoinedOption Joined[] = {
+      {"--sysroot=", "--sysroot"},
+      {"--gcc-toolchain=", "--gcc-toolchain"},
+      {"-resource-dir=", "-resource-dir"},
+      {"-fmodule-map-file=", "-fmodule-map-file"},
+      {"-fmodule-file=", "-fmodule-file"},
+      {"-fprebuilt-module-path=", "-fprebuilt-module-path"},
+      {"-fmodules-cache-path=", "-fmodules-cache-path"},
+      {"-ivfsoverlay=", "-ivfsoverlay"},
+      {"-working-directory=", "-working-directory"},
+      {"-include-pch", "-include-pch"},
+      {"-include", "-include"},
+      {"-imacros", "-imacros"},
+      {"-iframeworkwithsysroot", "-iframeworkwithsysroot"},
+      {"-isystem", "-isystem"},
+      {"-iquote", "-iquote"},
+      {"-idirafter", "-idirafter"},
+      {"-isysroot", "-isysroot"},
+      {"-iframework", "-iframework"},
+      {"-I", "-I"},
+      {"-F", "-F"},
+  };
+  static const llvm::StringSet<> Separate = {
+      "-I",
+      "-F",
+      "-iquote",
+      "-isystem",
+      "-idirafter",
+      "-isysroot",
+      "--sysroot",
+      "-iframework",
+      "-iframeworkwithsysroot",
+      "--gcc-toolchain",
+      "-resource-dir",
+      "-include",
+      "-include-pch",
+      "-imacros",
+      "-fmodule-map-file",
+      "-fmodule-file",
+      "-fprebuilt-module-path",
+      "-fmodules-cache-path",
+      "-ivfsoverlay",
+      "-working-directory",
+  };
+  llvm::ArrayRef<std::string> Args = Command.CommandLine;
+  for (size_t I = 1; I < Args.size(); ++I) {
+    llvm::StringRef Arg = Args[I];
+    if (Arg.starts_with("@"))
+      return error(
+          "cannot prove compiler response file paths after rename: {0}", Arg);
+    if (Separate.contains(Arg)) {
+      if (++I == Args.size())
+        return error("compiler option {0} has no path", Arg);
+      if (Args[I] == "-Xclang" && ++I == Args.size())
+        return error("compiler option {0} has no path", Arg);
+      if (auto Err = CheckPath(Args[I], Arg))
+        return Err;
+      continue;
+    }
+    for (const JoinedOption &Option : Joined) {
+      if (Arg.size() <= Option.Prefix.size() || !Arg.starts_with(Option.Prefix))
+        continue;
+      if (auto Err =
+              CheckPath(Arg.drop_front(Option.Prefix.size()), Option.Name))
+        return Err;
+      break;
+    }
+  }
+  return llvm::Error::success();
+}
+
+llvm::Error validateCompatibleFileRenameEdits(PathRef File,
+                                              llvm::ArrayRef<TextEdit> Expected,
+                                              llvm::ArrayRef<TextEdit> Actual) {
+  bool Equal =
+      Expected.size() == Actual.size() &&
+      llvm::equal(Expected, Actual, [](const TextEdit &L, const TextEdit &R) {
+        return L.range == R.range && L.newText == R.newText &&
+               L.annotationId == R.annotationId;
+      });
+  if (!Equal)
+    return error("compilation contexts require incompatible include edits for "
+                 "{0}",
+                 File);
+  return llvm::Error::success();
+}
+
 llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
     PathRef File, llvm::StringRef Code, const IncludeStructure &Includes,
     HeaderSearch &HeaderSearchInfo, PathRef BuildDir,
@@ -336,7 +754,7 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
                                                   FileStatus->getUniqueID();
                                          });
       MovedIncluder != Renames.end()) {
-    if (!pathEqual(File, MovedIncluder->OldPath))
+    if (File != MovedIncluder->OldPath)
       return error("cannot disambiguate moved includer {0} from filesystem "
                    "alias {1}",
                    MovedIncluder->OldPath, File);
@@ -362,7 +780,7 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
           return Candidate.OldIdentity == IncludedStatus->getUniqueID();
         });
     if (RenamedTarget != Renames.end() &&
-        !pathEqual(Inc.Resolved, RenamedTarget->OldPath))
+        Inc.Resolved != RenamedTarget->OldPath)
       return error("cannot disambiguate renamed include {0} from filesystem "
                    "alias {1}",
                    RenamedTarget->OldPath, Inc.Resolved);

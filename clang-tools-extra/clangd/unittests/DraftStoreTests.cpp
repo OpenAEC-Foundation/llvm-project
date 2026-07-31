@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "DraftStore.h"
+#include "llvm/ADT/STLExtras.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -34,6 +35,28 @@ TEST(DraftStore, Versions) {
   EXPECT_EQ("7", DS.addDraft(File, "7", "y"));
   EXPECT_EQ("7", DS.getDraft(File)->Version);
   EXPECT_EQ("y", *DS.getDraft(File)->Contents);
+}
+
+TEST(DraftStore, AtomicSnapshotContainsContentsAndVersions) {
+  DraftStore DS;
+  DS.addDraft("a.cpp", "3", "old a");
+  DS.addDraft("b.cpp", "7", "old b");
+
+  auto Snapshot = DS.getDrafts();
+  DS.addDraft("a.cpp", "4", "new a");
+  DS.removeDraft("b.cpp");
+
+  ASSERT_EQ(Snapshot.size(), 2u);
+  auto Find = [&](llvm::StringRef File) -> const DraftStore::Draft & {
+    auto It = llvm::find_if(
+        Snapshot, [&](const auto &Entry) { return Entry.first == File; });
+    EXPECT_NE(It, Snapshot.end());
+    return It->second;
+  };
+  EXPECT_EQ(Find("a.cpp").Version, "3");
+  EXPECT_EQ(*Find("a.cpp").Contents, "old a");
+  EXPECT_EQ(Find("b.cpp").Version, "7");
+  EXPECT_EQ(*Find("b.cpp").Contents, "old b");
 }
 
 } // namespace

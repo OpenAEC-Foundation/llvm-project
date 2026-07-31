@@ -15,7 +15,11 @@
 #include "llvm/Testing/Support/Error.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <future>
 
 using ::testing::_;
 using ::testing::AllOf;
@@ -61,6 +65,8 @@ public:
       : Storage(Storage), CacheHits(CacheHits) {}
   llvm::Error storeShard(llvm::StringRef ShardIdentifier,
                          IndexFileOut Shard) const override {
+    if (BeforeStore)
+      BeforeStore(ShardIdentifier);
     std::lock_guard<std::mutex> Lock(StorageMu);
     AccessedPaths.insert(ShardIdentifier);
     Storage[ShardIdentifier] = llvm::to_string(Shard);
@@ -91,6 +97,7 @@ public:
   }
 
   mutable llvm::StringSet<> AccessedPaths;
+  std::function<void(PathRef)> BeforeStore;
 };
 
 class BackgroundIndexTest : public ::testing::Test {
@@ -167,6 +174,12 @@ TEST_F(BackgroundIndexTest, Config) {
   EXPECT_THAT(runFuzzyFind(Idx, ""),
               UnorderedElementsAre(qName("foo"), qName("foo::two"),
                                    qName("bar"), qName("bar::one")));
+
+  Idx.ensureIncludeGraph();
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_THAT_EXPECTED(
+      Idx.includeGraphSnapshot(),
+      llvm::FailedWithMessage(testing::HasSubstr("disabled by configuration")));
 }
 
 TEST_F(BackgroundIndexTest, IndexTwoFiles) {
@@ -534,7 +547,7 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesIncludeGraphAndShard) {
 
   auto Before = Idx.includeGraphSnapshot();
   ASSERT_THAT_EXPECTED(Before, llvm::Succeeded());
-  ASSERT_TRUE(llvm::any_of(*Before, [&](const auto &File) {
+  ASSERT_TRUE(llvm::any_of(Before->Files, [&](const auto &File) {
     return pathEqual(File.File, Main) &&
            llvm::any_of(File.DirectIncludes, [&](PathRef Include) {
              return pathEqual(Include, Old);
@@ -549,7 +562,7 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesIncludeGraphAndShard) {
 
   auto After = Idx.includeGraphSnapshot();
   ASSERT_THAT_EXPECTED(After, llvm::Succeeded());
-  EXPECT_TRUE(llvm::any_of(*After, [&](const auto &File) {
+  EXPECT_TRUE(llvm::any_of(After->Files, [&](const auto &File) {
     return pathEqual(File.File, Main) &&
            llvm::any_of(File.DirectIncludes, [&](PathRef Include) {
              return pathEqual(Include, New);
@@ -557,6 +570,185 @@ TEST_F(BackgroundIndexTest, FileRenameMigratesIncludeGraphAndShard) {
   }));
   EXPECT_FALSE(Storage.contains(Old));
   EXPECT_TRUE(Storage.contains(New));
+}
+
+TEST_F(BackgroundIndexTest, IncludeGraphPreservesTranslationUnitContexts) {
+  MockFS FS;
+  const Path Common = testPath("root/common.h");
+  const Path A = testPath("root/a.cpp");
+  const Path B = testPath("root/b.cpp");
+  const Path ADep = testPath("root/a/dep.h");
+  const Path BDep = testPath("root/b/dep.h");
+  FS.Files[Common] = "#include <dep.h>\n";
+  FS.Files[A] = "#include \"common.h\"\n";
+  FS.Files[B] = "#include \"common.h\"\n";
+  FS.Files[ADep] = "struct FromA {};\n";
+  FS.Files[BDep] = "struct FromB {};\n";
+
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  tooling::CompileCommand Cmd;
+  Cmd.Directory = testPath("root");
+  Cmd.Filename = A;
+  Cmd.CommandLine = {"clang++", "-I", testPath("root/a"), A};
+  CDB.setCompileCommand(A, Cmd);
+  Cmd.Filename = B;
+  Cmd.CommandLine = {"clang++", "-I", testPath("root/b"), B};
+  CDB.setCompileCommand(B, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto Graph = Idx.includeGraphSnapshot();
+  ASSERT_THAT_EXPECTED(Graph, llvm::Succeeded());
+  EXPECT_EQ(Graph->Commands.lookup(A).CommandLine[2], testPath("root/a"));
+  EXPECT_EQ(Graph->Commands.lookup(B).CommandLine[2], testPath("root/b"));
+  EXPECT_THAT(
+      Graph->Files,
+      testing::AllOf(
+          Contains(testing::AllOf(
+              testing::Field(&BackgroundIndex::IndexedFile::File, Common),
+              testing::Field(&BackgroundIndex::IndexedFile::DependentTU, A),
+              testing::Field(&BackgroundIndex::IndexedFile::DirectIncludes,
+                             ElementsAre(ADep)))),
+          Contains(testing::AllOf(
+              testing::Field(&BackgroundIndex::IndexedFile::File, Common),
+              testing::Field(&BackgroundIndex::IndexedFile::DependentTU, B),
+              testing::Field(&BackgroundIndex::IndexedFile::DirectIncludes,
+                             ElementsAre(BDep))))));
+}
+
+TEST_F(BackgroundIndexTest, IncludeGraphMarksConditionalIncludes) {
+  MockFS FS;
+  const Path Main = testPath("root/main.cpp");
+  FS.Files[Main] = R"cpp(
+#if ENABLE_HEADER
+#include "conditional.h"
+#endif
+)cpp";
+  FS.Files[testPath("root/conditional.h")] = "";
+
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  tooling::CompileCommand Cmd;
+  Cmd.Directory = testPath("root");
+  Cmd.Filename = Main;
+  Cmd.CommandLine = {"clang++", "-DENABLE_HEADER=0", Main};
+  CDB.setCompileCommand(Main, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto Graph = Idx.includeGraphSnapshot();
+  ASSERT_THAT_EXPECTED(Graph, llvm::Succeeded());
+  EXPECT_THAT(
+      Graph->Files,
+      Contains(testing::AllOf(
+          testing::Field(&BackgroundIndex::IndexedFile::File, Main),
+          testing::Field(&BackgroundIndex::IndexedFile::HasConditionalIncludes,
+                         true))));
+}
+
+TEST_F(BackgroundIndexTest, FileRenameOnlyReindexesAffectedContexts) {
+  MockFS FS;
+  const Path Main = testPath("root/main.cpp");
+  const Path Old = testPath("root/old.h");
+  const Path New = testPath("root/new.h");
+  const Path Unrelated = testPath("root/unrelated.cpp");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+  FS.Files[Unrelated] = "int unrelated;\n";
+
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  tooling::CompileCommand Cmd;
+  Cmd.Directory = testPath("root");
+  Cmd.Filename = Main;
+  Cmd.CommandLine = {"clang++", Main};
+  CDB.setCompileCommand(Main, Cmd);
+  Cmd.Filename = Unrelated;
+  Cmd.CommandLine = {"clang++", Unrelated};
+  CDB.setCompileCommand(Unrelated, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  MSS.AccessedPaths.clear();
+  FS.Files[New] = FS.Files[Old];
+  FS.Files.erase(Old);
+  FS.Files[Main] = "#include \"new.h\"\n";
+  ASSERT_THAT_ERROR(Idx.filesRenamed({{Old, New}}), llvm::Succeeded());
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_FALSE(MSS.AccessedPaths.contains(Unrelated));
+}
+
+TEST_F(BackgroundIndexTest, FileRenameInvalidatesActiveIndexingCommit) {
+  MockFS FS;
+  const Path Main = testPath("root/main.cpp");
+  const Path Old = testPath("root/old.h");
+  const Path New = testPath("root/new.h");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  std::mutex Mu;
+  std::condition_variable CV;
+  bool StoreEntered = false;
+  bool ReleaseStore = false;
+  MSS.BeforeStore = [&](PathRef Shard) {
+    if (Shard != Old)
+      return;
+    std::unique_lock<std::mutex> Lock(Mu);
+    StoreEntered = true;
+    CV.notify_all();
+    CV.wait(Lock, [&] { return ReleaseStore; });
+  };
+
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  tooling::CompileCommand Cmd;
+  Cmd.Directory = testPath("root");
+  Cmd.Filename = Main;
+  Cmd.CommandLine = {"clang++", Main};
+  CDB.setCompileCommand(Main, Cmd);
+  {
+    std::unique_lock<std::mutex> Lock(Mu);
+    ASSERT_TRUE(CV.wait_for(Lock, std::chrono::seconds(10),
+                            [&] { return StoreEntered; }));
+  }
+
+  FS.Files[New] = FS.Files[Old];
+  FS.Files.erase(Old);
+  FS.Files[Main] = "#include \"new.h\"\n";
+  auto Rename = std::async(std::launch::async,
+                           [&] { return Idx.filesRenamed({{Old, New}}); });
+  EXPECT_EQ(Rename.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  {
+    std::lock_guard<std::mutex> Lock(Mu);
+    ReleaseStore = true;
+  }
+  CV.notify_all();
+  ASSERT_THAT_ERROR(Rename.get(), llvm::Succeeded());
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto Graph = Idx.includeGraphSnapshot();
+  ASSERT_THAT_EXPECTED(Graph, llvm::Succeeded());
+  EXPECT_THAT(Graph->Files,
+              Contains(testing::AllOf(
+                  testing::Field(&BackgroundIndex::IndexedFile::File, Main),
+                  testing::Field(&BackgroundIndex::IndexedFile::DirectIncludes,
+                                 ElementsAre(New)))));
+  EXPECT_FALSE(Storage.contains(Old));
 }
 
 TEST_F(BackgroundIndexTest, IncludeGraphRejectsMissingTranslationUnit) {
@@ -575,9 +767,173 @@ TEST_F(BackgroundIndexTest, IncludeGraphRejectsMissingTranslationUnit) {
   CDB.setCompileCommand(Missing, Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
+  EXPECT_THAT_EXPECTED(Idx.includeGraphSnapshot(),
+                       llvm::FailedWithMessage(
+                           testing::HasSubstr("background indexing failed")));
+}
+
+TEST_F(BackgroundIndexTest, IncludeGraphRecoversFromMalformedLoadedShard) {
+  MockFS FS;
+  const Path Main = testPath("root/main.cpp");
+  FS.Files[Main] = "int value;\n";
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = Main;
+  Cmd.Directory = testPath("root");
+  Cmd.CommandLine = {"clang++", Main};
+  {
+    OverlayCDB CDB(/*Base=*/nullptr);
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                        /*Opts=*/{});
+    CDB.setCompileCommand(Main, Cmd);
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  }
+
+  auto Corrupt = readIndexFile(Storage.lookup(Main), SymbolOrigin::Background);
+  ASSERT_THAT_EXPECTED(Corrupt, llvm::Succeeded());
+  ASSERT_TRUE(Corrupt->Sources);
+  Corrupt->Sources->erase(URI::create(Main).toString());
+  Storage[Main] = llvm::to_string(IndexFileOut(*Corrupt));
+
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  CDB.setCompileCommand(Main, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Graph = Idx.includeGraphSnapshot();
+  ASSERT_THAT_EXPECTED(Graph, llvm::Succeeded());
+  EXPECT_THAT(Graph->Files, Contains(testing::Field(
+                                &BackgroundIndex::IndexedFile::File, Main)));
+}
+
+TEST_F(BackgroundIndexTest, IncludeGraphBuildsOnDemandAfterCacheLoad) {
+  MockFS FS;
+  const Path MainA = testPath("root/a.cpp");
+  const Path MainB = testPath("root/b.cpp");
+  FS.Files[MainA] = "int a;\n";
+  FS.Files[MainB] = "int b;\n";
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  auto Command = [](PathRef File) {
+    tooling::CompileCommand Cmd;
+    Cmd.Filename = File.str();
+    Cmd.Directory = testPath("root");
+    Cmd.CommandLine = {"clang++", File.str()};
+    return Cmd;
+  };
+  {
+    OverlayCDB CDB(/*Base=*/nullptr);
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                        /*Opts=*/{});
+    CDB.setCompileCommand(MainA, Command(MainA));
+    CDB.setCompileCommand(MainB, Command(MainB));
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  }
+
+  std::atomic<unsigned> Enqueued{0};
+  BackgroundIndex::Options Opts;
+  Opts.OnProgress = [&](BackgroundQueue::Stats S) { Enqueued = S.Enqueued; };
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(
+      FS, CDB, [&](llvm::StringRef) { return &MSS; }, std::move(Opts));
+  CDB.setCompileCommand(MainA, Command(MainA));
+  CDB.setCompileCommand(MainB, Command(MainB));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
   EXPECT_THAT_EXPECTED(
       Idx.includeGraphSnapshot(),
       llvm::FailedWithMessage(testing::HasSubstr("no translation unit")));
+  const unsigned BeforeEnsure = Enqueued;
+
+  std::thread First([&] { Idx.ensureIncludeGraph(); });
+  std::thread Second([&] { Idx.ensureIncludeGraph(); });
+  First.join();
+  Second.join();
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(Enqueued, BeforeEnsure + 2);
+  auto Graph = Idx.includeGraphSnapshot();
+  ASSERT_THAT_EXPECTED(Graph, llvm::Succeeded());
+  EXPECT_THAT(Graph->TranslationUnits, UnorderedElementsAre(MainA, MainB));
+
+  const unsigned AfterSuccess = Enqueued;
+  Idx.ensureIncludeGraph();
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(Enqueued, AfterSuccess);
+}
+
+TEST_F(BackgroundIndexTest, IncludeGraphBuildIsInvalidatedByRenameEpoch) {
+  MockFS FS;
+  const Path Main = testPath("root/main.cpp");
+  const Path Old = testPath("root/old.h");
+  const Path New = testPath("root/new.h");
+  FS.Files[Main] = "int value;\n";
+  FS.Files[Old] = "";
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = Main;
+  Cmd.Directory = testPath("root");
+  Cmd.CommandLine = {"clang++", Main};
+  {
+    OverlayCDB CDB(/*Base=*/nullptr);
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                        /*Opts=*/{});
+    CDB.setCompileCommand(Main, Cmd);
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  }
+
+  std::mutex Mu;
+  std::condition_variable CV;
+  bool ShouldBlock = false;
+  bool Entered = false;
+  bool Released = false;
+  BackgroundIndex::Options Opts;
+  Opts.ThreadPoolSize = 1;
+  Opts.ContextProvider = [&](PathRef File) {
+    std::unique_lock<std::mutex> Lock(Mu);
+    if (File == Main && ShouldBlock) {
+      Entered = true;
+      CV.notify_all();
+      CV.wait(Lock, [&] { return Released; });
+    }
+    return Context::current().clone();
+  };
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(
+      FS, CDB, [&](llvm::StringRef) { return &MSS; }, std::move(Opts));
+  CDB.setCompileCommand(Main, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  {
+    std::lock_guard<std::mutex> Lock(Mu);
+    ShouldBlock = true;
+  }
+  Idx.ensureIncludeGraph();
+  {
+    std::unique_lock<std::mutex> Lock(Mu);
+    ASSERT_TRUE(
+        CV.wait_for(Lock, std::chrono::seconds(10), [&] { return Entered; }));
+  }
+  FS.Files[New] = FS.Files[Old];
+  FS.Files.erase(Old);
+  ASSERT_THAT_ERROR(Idx.filesRenamed({{Old, New}}), llvm::Succeeded());
+  {
+    std::lock_guard<std::mutex> Lock(Mu);
+    ShouldBlock = false;
+    Released = true;
+  }
+  CV.notify_all();
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_THAT_EXPECTED(
+      Idx.includeGraphSnapshot(),
+      llvm::FailedWithMessage(testing::HasSubstr("no translation unit")));
+
+  Idx.ensureIncludeGraph();
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  ASSERT_THAT_EXPECTED(Idx.includeGraphSnapshot(), llvm::Succeeded());
 }
 
 TEST_F(BackgroundIndexTest, ShardStorageLoad) {

@@ -141,9 +141,18 @@ class BackgroundIndex : public SwapIndex {
 public:
   struct IndexedFile {
     Path File;
+    Path DependentTU;
     FileDigest Digest{{0}};
     IncludeGraphNode::SourceFlag Flags{};
     std::vector<Path> DirectIncludes;
+    bool HasConditionalIncludes = false;
+  };
+
+  struct IncludeGraphSnapshot {
+    uint64_t Generation = 0;
+    std::vector<IndexedFile> Files;
+    std::vector<Path> TranslationUnits;
+    llvm::StringMap<tooling::CompileCommand> Commands;
   };
 
   struct Options {
@@ -196,10 +205,18 @@ public:
     return blockUntilIdle(TimeoutSeconds);
   }
 
+  /// Ensures the exact per-translation-unit include graph is available.
+  ///
+  /// Persisted file shards are sufficient for the symbol index, but collapse
+  /// context-dependent include graphs when a header is used by several TUs.
+  /// This schedules live indexing only for TUs whose exact graph has not been
+  /// built in this process.
+  void ensureIncludeGraph();
+
   /// Returns a consistent snapshot of the persisted include graph.
   ///
   /// Paths are absolute and direct includes are resolved file identities.
-  llvm::Expected<std::vector<IndexedFile>> includeGraphSnapshot() const;
+  llvm::Expected<IncludeGraphSnapshot> includeGraphSnapshot() const;
 
   /// Migrates in-memory include-graph state and removes old persisted shards.
   llvm::Error filesRenamed(llvm::ArrayRef<std::pair<Path, Path>> Renames);
@@ -213,12 +230,18 @@ private:
     bool HadErrors = false;
   };
 
+  struct IncludeGraphError {
+    Path File;
+    Path DependentTU;
+    std::string Message;
+  };
+
   /// Given index results from a TU, only update symbols coming from files with
   /// different digests than \p ShardVersionsSnapshot. Also stores new index
   /// information on IndexStorage.
   void update(llvm::StringRef MainFile, IndexFileIn Index,
               const llvm::StringMap<ShardVersion> &ShardVersionsSnapshot,
-              bool HadErrors);
+              bool HadErrors, uint64_t Generation);
 
   // configuration
   const ThreadsafeFS &TFS;
@@ -226,16 +249,25 @@ private:
   llvm::ThreadPriority IndexingPriority;
   std::function<Context(PathRef)> ContextProvider;
 
-  llvm::Error index(tooling::CompileCommand);
+  llvm::Error index(tooling::CompileCommand, uint64_t Generation);
 
   FileSymbols IndexedSymbols;
   BackgroundIndexRebuilder Rebuilder;
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
   mutable std::mutex ShardVersionsMu;
-  llvm::StringMap<IndexedFile> IndexedFiles;
-  std::optional<std::string> IncludeGraphError;
+  std::vector<IndexedFile> IndexedFiles;
+  llvm::StringMap<tooling::CompileCommand> IndexedCommands;
+  std::vector<IncludeGraphError> IncludeGraphErrors;
   llvm::StringSet<> KnownTUs;
+  llvm::StringSet<> FreshlyIndexedTUs;
+  // TUs with an exact, live include-graph build queued or running. The value
+  // is the rename epoch in which the task was scheduled.
+  llvm::StringMap<uint64_t> PendingIncludeGraphTUs;
   llvm::StringMap<std::string> IndexFailures;
+  // RenameEpoch invalidates indexing work whose paths refer to the namespace
+  // before a file rename. GraphGeneration versions every observable snapshot.
+  uint64_t RenameEpoch = 0;
+  uint64_t GraphGeneration = 0;
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.
@@ -243,8 +275,9 @@ private:
 
   BackgroundQueue::Task
   changedFilesTask(const std::vector<std::string> &ChangedFiles);
-  BackgroundQueue::Task indexFileTask(std::string Path,
-                                      bool BypassDuplicateSuppression = false);
+  BackgroundQueue::Task
+  indexFileTask(std::string Path, bool BypassDuplicateSuppression = false,
+                std::optional<uint64_t> RequiredRenameEpoch = std::nullopt);
 
   // from lowest to highest priority
   enum QueuePriority {

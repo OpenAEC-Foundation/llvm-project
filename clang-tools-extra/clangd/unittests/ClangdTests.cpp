@@ -40,6 +40,7 @@
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -72,6 +73,28 @@ bool diagsContainErrors(const std::vector<Diag> &Diagnostics) {
       return true;
   }
   return false;
+}
+
+llvm::Expected<WorkspaceEdit>
+runPrepareFileRename(ClangdServer &Server,
+                     llvm::ArrayRef<std::pair<Path, Path>> Renames) {
+  std::optional<llvm::Expected<WorkspaceEdit>> Result;
+  Notification Done;
+  Server.prepareFileRename(Renames, [&](llvm::Expected<WorkspaceEdit> Value) {
+    Result.emplace(std::move(Value));
+    Done.notify();
+  });
+  Done.wait();
+  assert(Result && "file rename callback was not called");
+  return std::move(*Result);
+}
+
+tooling::CompileCommand commandFor(PathRef File) {
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = File.str();
+  Command.CommandLine = {"clang++", File.str()};
+  return Command;
 }
 
 class ErrorCheckingCallbacks : public ClangdServer::Callbacks {
@@ -1359,6 +1382,206 @@ $inactive4[[  int inactiveInt3;]]
               ElementsAre(ElementsAre(
                   Source.range("inactive1"), Source.range("inactive2"),
                   Source.range("inactive3"), Source.range("inactive4"))));
+}
+
+TEST(ClangdServerFileRename, ReturnsVersionedDocumentChanges) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  runAddDocument(Server, Main, FS.Files.lookup(Main), "7");
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  const TextDocumentEdit &Edit = Result->documentChanges->front();
+  EXPECT_EQ(Edit.textDocument.uri.file(), Main);
+  EXPECT_EQ(Edit.textDocument.version, 7);
+  ASSERT_THAT(Edit.edits, SizeIs(1));
+  EXPECT_EQ(Edit.edits.front().newText, "\"new.h\"");
+  EXPECT_FALSE(Result->changes);
+}
+
+TEST(ClangdServerFileRename, UpdatesIncludeInsideOrdinaryHeaderGuard) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Guarded = testPath("guarded.h");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"guarded.h\"\n";
+  FS.Files[Guarded] = R"cpp(
+#ifndef GUARDED_H
+#define GUARDED_H
+#include "old.h"
+#endif
+)cpp";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().textDocument.uri.file(), Guarded);
+  EXPECT_EQ(Result->documentChanges->front().edits.front().newText,
+            "\"new.h\"");
+}
+
+TEST(ClangdServerFileRename, UpdatesInactiveConditionalInclude) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = R"cpp(
+#if ENABLED
+#include "old.h"
+#endif
+int main() { return 0; }
+)cpp";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  auto Command = commandFor(Main);
+  Command.CommandLine.insert(Command.CommandLine.begin() + 1, "-DENABLED=0");
+  CDB.setCompileCommand(Main, std::move(Command));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().textDocument.uri.file(), Main);
+  ASSERT_THAT(Result->documentChanges->front().edits, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().edits.front().newText,
+            "\"new.h\"");
+}
+
+TEST(ClangdServerFileRename, RejectsOrphanWorkspaceSource) {
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Orphan = testPath("orphan.cpp");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Orphan] = "int orphan;\n";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::FailedWithMessage(testing::HasSubstr(
+                           "not represented in the background include graph")));
+}
+
+TEST(ClangdServerFileRename, RejectsDraftChangeDuringPreparation) {
+  class BlockingCDB : public OverlayCDB {
+  public:
+    explicit BlockingCDB(const GlobalCompilationDatabase *Base)
+        : OverlayCDB(Base) {}
+
+    bool blockUntilIdle(Deadline) const override {
+      std::unique_lock<std::mutex> Lock(Mu);
+      if (!ShouldBlock)
+        return true;
+      Entered = true;
+      CV.notify_all();
+      CV.wait(Lock, [&] { return Released; });
+      return true;
+    }
+
+    void startBlocking() {
+      std::lock_guard<std::mutex> Lock(Mu);
+      ShouldBlock = true;
+    }
+
+    void waitUntilBlocked() const {
+      std::unique_lock<std::mutex> Lock(Mu);
+      ASSERT_TRUE(
+          CV.wait_for(Lock, std::chrono::seconds(10), [&] { return Entered; }));
+    }
+
+    void release() const {
+      {
+        std::lock_guard<std::mutex> Lock(Mu);
+        Released = true;
+      }
+      CV.notify_all();
+    }
+
+  private:
+    mutable std::mutex Mu;
+    mutable std::condition_variable CV;
+    mutable bool ShouldBlock = false;
+    mutable bool Entered = false;
+    mutable bool Released = false;
+  };
+
+  MockFS FS;
+  const Path Main = testPath("main.cpp");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+  FS.Files[Main] = "#include \"old.h\"\n";
+  FS.Files[Old] = "";
+  MockCompilationDatabase Base(testRoot());
+  BlockingCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Main, commandFor(Main));
+  runAddDocument(Server, Main, FS.Files.lookup(Main), "1");
+
+  CDB.startBlocking();
+  std::optional<llvm::Expected<WorkspaceEdit>> Result;
+  Notification Done;
+  Server.prepareFileRename({{{Old}, {New}}},
+                           [&](llvm::Expected<WorkspaceEdit> Value) {
+                             Result.emplace(std::move(Value));
+                             Done.notify();
+                           });
+  CDB.waitUntilBlocked();
+  Server.addDocument(Main, "#include \"old.h\"\n// changed\n", "2");
+  CDB.release();
+  Done.wait();
+  ASSERT_TRUE(Result);
+  ASSERT_FALSE(static_cast<bool>(*Result));
+  bool WasContentModified = false;
+  llvm::handleAllErrors(
+      Result->takeError(),
+      [&](const LSPError &E) {
+        WasContentModified = E.Code == ErrorCode::ContentModified;
+      },
+      [&](const llvm::ErrorInfoBase &E) {
+        ADD_FAILURE() << "unexpected error: " << E.message();
+      });
+  EXPECT_TRUE(WasContentModified);
 }
 
 } // namespace

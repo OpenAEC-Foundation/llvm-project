@@ -667,7 +667,7 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
           ? llvm::json::Object{{"prepareProvider", true}}
           : llvm::json::Value(true);
 
-  if (Params.capabilities.WillRenameFiles ||
+  if ((Params.capabilities.WillRenameFiles && SupportsDocumentChanges) ||
       Params.capabilities.DidRenameFiles) {
     llvm::json::Object FileOperations;
     auto Registration = [] {
@@ -678,7 +678,7 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
                       }}},
       };
     };
-    if (Params.capabilities.WillRenameFiles)
+    if (Params.capabilities.WillRenameFiles && SupportsDocumentChanges)
       FileOperations["willRename"] = Registration();
     if (Params.capabilities.DidRenameFiles)
       FileOperations["didRename"] = Registration();
@@ -807,6 +807,9 @@ void ClangdLSPServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
 
 void ClangdLSPServer::onWillRenameFiles(const RenameFilesParams &Params,
                                         Callback<WorkspaceEdit> Reply) {
+  if (!SupportsDocumentChanges)
+    return Reply(error("workspace/willRenameFiles requires documentChanges "
+                       "client support"));
   std::vector<std::pair<Path, Path>> Renames;
   Renames.reserve(Params.files.size());
   for (const FileRename &Rename : Params.files)

@@ -66,11 +66,15 @@ protected:
   }
 
   LSPClient &start() {
+    (void)startWithInitialize(llvm::json::Object{});
+    return Client;
+  }
+
+  llvm::json::Value startWithInitialize(llvm::json::Object Params) {
     EXPECT_FALSE(Server) << "Already initialized";
     Server.emplace(Client.transport(), FS, Opts);
     ServerThread.emplace([&] { EXPECT_TRUE(Server->run()); });
-    Client.call("initialize", llvm::json::Object{});
-    return Client;
+    return Client.call("initialize", std::move(Params)).takeValue();
   }
 
   void stop() {
@@ -155,6 +159,50 @@ TEST_F(LSPTest, Diagnostics) {
 
   Client.didClose("foo.cpp");
   EXPECT_THAT(Client.diagnostics("foo.cpp"), llvm::ValueIs(testing::IsEmpty()));
+}
+
+TEST_F(LSPTest, FileRenameRequiresVersionedDocumentChanges) {
+  auto InitializeParams = [](bool DocumentChanges) {
+    return llvm::json::Object{
+        {"capabilities",
+         llvm::json::Object{
+             {"workspace",
+              llvm::json::Object{
+                  {"workspaceEdit",
+                   llvm::json::Object{{"documentChanges", DocumentChanges}}},
+                  {"fileOperations",
+                   llvm::json::Object{{"willRename", true},
+                                      {"didRename", true}}}}}}}};
+  };
+
+  llvm::json::Value Initialize = startWithInitialize(InitializeParams(false));
+  const auto *Capabilities =
+      Initialize.getAsObject()->getObject("capabilities");
+  ASSERT_TRUE(Capabilities);
+  const auto *Workspace = Capabilities->getObject("workspace");
+  ASSERT_TRUE(Workspace);
+  const auto *Operations = Workspace->getObject("fileOperations");
+  ASSERT_TRUE(Operations);
+  EXPECT_FALSE(Operations->get("willRename"));
+  EXPECT_TRUE(Operations->get("didRename"));
+}
+
+TEST_F(LSPTest, AdvertisesFileRenameWithDocumentChanges) {
+  llvm::json::Object Params{
+      {"capabilities",
+       llvm::json::Object{
+           {"workspace",
+            llvm::json::Object{{"workspaceEdit",
+                                llvm::json::Object{{"documentChanges", true}}},
+                               {"fileOperations",
+                                llvm::json::Object{{"willRename", true}}}}}}}};
+  llvm::json::Value Initialize = startWithInitialize(std::move(Params));
+  const auto *Operations = Initialize.getAsObject()
+                               ->getObject("capabilities")
+                               ->getObject("workspace")
+                               ->getObject("fileOperations");
+  ASSERT_TRUE(Operations);
+  EXPECT_TRUE(Operations->get("willRename"));
 }
 
 TEST_F(LSPTest, DiagnosticsHeaderSaved) {

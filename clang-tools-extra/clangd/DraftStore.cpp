@@ -36,6 +36,15 @@ std::vector<Path> DraftStore::getActiveFiles() const {
   return ResultVector;
 }
 
+std::vector<std::pair<Path, DraftStore::Draft>> DraftStore::getDrafts() const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  std::vector<std::pair<Path, Draft>> Result;
+  Result.reserve(Drafts.size());
+  for (const auto &Entry : Drafts)
+    Result.emplace_back(Entry.first().str(), Entry.getValue().D);
+  return Result;
+}
+
 static void increment(std::string &S) {
   // Ensure there is a numeric suffix.
   if (S.empty() || !llvm::isDigit(S.back())) {

@@ -15,8 +15,13 @@
 #include "TestTU.h"
 #include "support/Logger.h"
 #include "clang/Format/Format.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Testing/Support/Error.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -221,6 +226,223 @@ TEST(FileRename, RejectsInvalidDirectoryDestinations) {
       expandFileRenames({{testPath("old"), testPath("old/nested")}}, testRoot(),
                         *VFS),
       llvm::FailedWithMessage(HasSubstr("inside its source directory")));
+}
+
+TEST(FileRename, RejectsSymlinkEscapesFromWorkspace) {
+  llvm::SmallString<256> Workspace;
+  llvm::SmallString<256> Outside;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("clangd-rename-workspace",
+                                                    Workspace));
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("clangd-rename-outside", Outside));
+  llvm::scope_exit Cleanup([&] {
+    llvm::sys::fs::remove_directories(Workspace);
+    llvm::sys::fs::remove_directories(Outside);
+  });
+  llvm::SmallString<256> InsideFile(Workspace);
+  llvm::sys::path::append(InsideFile, "inside.h");
+  llvm::SmallString<256> OutsideFile(Outside);
+  llvm::sys::path::append(OutsideFile, "out.h");
+  for (PathRef File : {InsideFile.str(), OutsideFile.str()}) {
+    std::error_code EC;
+    llvm::raw_fd_ostream Stream(File, EC);
+    ASSERT_FALSE(EC);
+  }
+  llvm::SmallString<256> Escape(Workspace);
+  llvm::sys::path::append(Escape, "escape");
+  ASSERT_FALSE(llvm::sys::fs::create_symlink(Outside, Escape));
+  auto FS = llvm::vfs::getRealFileSystem();
+
+  llvm::SmallString<256> EscapedSource(Escape);
+  llvm::sys::path::append(EscapedSource, "out.h");
+  llvm::SmallString<256> Renamed(Workspace);
+  llvm::sys::path::append(Renamed, "renamed.h");
+
+  EXPECT_THAT_EXPECTED(
+      expandFileRenames({{{EscapedSource.str().str()}, {Renamed.str().str()}}},
+                        Workspace, *FS),
+      llvm::FailedWithMessage(HasSubstr("outside the workspace")));
+  llvm::SmallString<256> EscapedDestination(Escape);
+  llvm::sys::path::append(EscapedDestination, "renamed.h");
+  EXPECT_THAT_EXPECTED(
+      expandFileRenames(
+          {{{InsideFile.str().str()}, {EscapedDestination.str().str()}}},
+          Workspace, *FS),
+      llvm::FailedWithMessage(HasSubstr("outside the workspace")));
+}
+
+TEST(FileRename, UsesFilesystemCaseSensitivityForDestinationCollisions) {
+  llvm::SmallString<256> Workspace;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("clangd-rename-case", Workspace));
+  llvm::scope_exit Cleanup(
+      [&] { llvm::sys::fs::remove_directories(Workspace); });
+  auto Path = [&](llvm::StringRef Name) {
+    llvm::SmallString<256> Result(Workspace);
+    llvm::sys::path::append(Result, Name);
+    return Result.str().str();
+  };
+  for (PathRef File : {Path("A.h"), Path("a.h")}) {
+    std::error_code EC;
+    llvm::raw_fd_ostream Stream(File, EC);
+    ASSERT_FALSE(EC);
+  }
+  auto FS = llvm::vfs::getRealFileSystem();
+
+  auto Expanded = expandFileRenames(
+      {{{Path("A.h")}, {Path("New.h")}}, {{Path("a.h")}, {Path("new.h")}}},
+      Workspace, *FS);
+  ASSERT_THAT_EXPECTED(Expanded, llvm::Succeeded());
+  EXPECT_EQ(Expanded->size(), 2u);
+}
+
+TEST(FileRename, RejectsMovedCompilerConfigurationPaths) {
+  tooling::CompileCommand Command;
+  Command.Directory = "/workspace";
+  Command.Filename = "/workspace/main.cpp";
+  const std::pair<Path, Path> Rename{"/workspace/config", "/workspace/moved"};
+  for (std::vector<std::string> Args : {
+           std::vector<std::string>{"clang", "-I", "/workspace/config"},
+           std::vector<std::string>{"clang", "-iquote/workspace/config"},
+           std::vector<std::string>{"clang", "--sysroot=/workspace/config"},
+           std::vector<std::string>{"clang", "-resource-dir=/workspace/config"},
+           std::vector<std::string>{"clang", "-include",
+                                    "/workspace/config/prefix.h"},
+           std::vector<std::string>{"clang", "-Xclang", "-ivfsoverlay",
+                                    "-Xclang", "/workspace/config/vfs.yaml"},
+           std::vector<std::string>{"clang",
+                                    "-fmodule-map-file=/workspace/config"},
+       }) {
+    Command.CommandLine = std::move(Args);
+    EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                      llvm::FailedWithMessage(HasSubstr("compiler path")));
+  }
+}
+
+TEST(FileRename, RejectsMovedWorkingDirectoryAndResponseFiles) {
+  tooling::CompileCommand Command;
+  Command.Directory = "/workspace/config";
+  Command.Filename = "/workspace/config/main.cpp";
+  Command.CommandLine = {"clang", "main.cpp"};
+  const std::pair<Path, Path> Rename{"/workspace/config", "/workspace/moved"};
+  EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                    llvm::FailedWithMessage(HasSubstr("working directory")));
+
+  Command.Directory = "/workspace";
+  Command.CommandLine = {"clang", "@config/arguments.rsp"};
+  EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                    llvm::FailedWithMessage(HasSubstr("response file")));
+}
+
+TEST(FileRename, RejectsCompilerPathAliasingRenamedFile) {
+  llvm::SmallString<256> Workspace;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("clangd-rename-alias", Workspace));
+  llvm::scope_exit Cleanup(
+      [&] { llvm::sys::fs::remove_directories(Workspace); });
+  auto FilePath = [&](llvm::StringRef Name) {
+    llvm::SmallString<256> Result(Workspace);
+    llvm::sys::path::append(Result, Name);
+    return Result.str().str();
+  };
+  const std::string Config = FilePath("config.h");
+  const std::string Alias = FilePath("alias.h");
+  const std::string Renamed = FilePath("new.h");
+  {
+    std::error_code EC;
+    llvm::raw_fd_ostream Stream(Config, EC);
+    ASSERT_FALSE(EC);
+  }
+  ASSERT_FALSE(llvm::sys::fs::create_hard_link(Config, Alias));
+  auto FS = llvm::vfs::getRealFileSystem();
+  auto ConfigStatus = FS->status(Config);
+  ASSERT_TRUE(ConfigStatus);
+  FileRenameMapping Mapping{Config, Renamed, ConfigStatus->getUniqueID()};
+  tooling::CompileCommand Command;
+  Command.Directory = Workspace.str().str();
+  Command.Filename = FilePath("main.cpp");
+  Command.CommandLine = {"clang", "-include", Alias};
+  const std::pair<Path, Path> Rename{Config, Renamed};
+
+  EXPECT_THAT_ERROR(
+      validateCompileCommandForRenames(Command, {Rename}, {Mapping}, FS.get()),
+      llvm::FailedWithMessage(HasSubstr("compiler path")));
+}
+
+TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
+  MockFS FS;
+  FS.Files[testPath("main.cpp")] = "";
+  FS.Files[testPath("include/header.h")] = "";
+  FS.Files[testPath("README.md")] = "";
+  auto VFS = FS.view(std::nullopt);
+
+  auto Files = workspaceSourceFiles(testRoot(), *VFS);
+  ASSERT_THAT_EXPECTED(Files, llvm::Succeeded());
+  EXPECT_THAT(
+      *Files,
+      testing::UnorderedElementsAre(
+          testing::AllOf(
+              testing::Field(&WorkspaceSourceFile::File, testPath("main.cpp")),
+              testing::Field(&WorkspaceSourceFile::IsHeader, false)),
+          testing::AllOf(
+              testing::Field(&WorkspaceSourceFile::File,
+                             testPath("include/header.h")),
+              testing::Field(&WorkspaceSourceFile::IsHeader, true))));
+}
+
+TEST(FileRename, DetectsConditionalIncludeDirectives) {
+  MockFS FS;
+  FS.Files[testPath("conditional.h")] = R"cpp(
+#if ENABLED
+#include "selected.h"
+#endif
+)cpp";
+  FS.Files[testPath("unconditional.h")] = "#include \"always.h\"\n";
+  FS.Files[testPath("guarded.h")] = R"cpp(
+#ifndef GUARDED_H
+#define GUARDED_H
+#include "ordinary.h"
+#endif
+)cpp";
+  FS.Files[testPath("nested-in-guard.h")] = R"cpp(
+#ifndef NESTED_IN_GUARD_H
+#define NESTED_IN_GUARD_H
+#if ENABLED
+#include "selected.h"
+#endif
+#endif
+)cpp";
+  auto VFS = FS.view(std::nullopt);
+
+  auto Conditional =
+      conditionalIncludeDirectives(testPath("conditional.h"), *VFS);
+  ASSERT_THAT_EXPECTED(Conditional, llvm::Succeeded());
+  EXPECT_THAT(*Conditional,
+              testing::ElementsAre(testing::Field(
+                  &ConditionalInclusion::Written, "\"selected.h\"")));
+  auto Unconditional =
+      conditionalIncludeDirectives(testPath("unconditional.h"), *VFS);
+  ASSERT_THAT_EXPECTED(Unconditional, llvm::Succeeded());
+  EXPECT_THAT(*Unconditional, testing::IsEmpty());
+  auto Guarded = conditionalIncludeDirectives(testPath("guarded.h"), *VFS);
+  ASSERT_THAT_EXPECTED(Guarded, llvm::Succeeded());
+  EXPECT_THAT(*Guarded, testing::IsEmpty());
+  auto Nested =
+      conditionalIncludeDirectives(testPath("nested-in-guard.h"), *VFS);
+  ASSERT_THAT_EXPECTED(Nested, llvm::Succeeded());
+  EXPECT_THAT(*Nested, testing::ElementsAre(testing::Field(
+                           &ConditionalInclusion::Written, "\"selected.h\"")));
+}
+
+TEST(FileRename, RejectsIncompatibleTranslationUnitEdits) {
+  TextEdit First{Range{{0, 9}, {0, 16}}, "\"first.h\""};
+  TextEdit Second{Range{{0, 9}, {0, 16}}, "\"second.h\""};
+  EXPECT_THAT_ERROR(
+      validateCompatibleFileRenameEdits("common.h", {First}, {First}),
+      llvm::Succeeded());
+  EXPECT_THAT_ERROR(
+      validateCompatibleFileRenameEdits("common.h", {First}, {Second}),
+      llvm::FailedWithMessage(HasSubstr("incompatible include edits")));
 }
 
 } // namespace

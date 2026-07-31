@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -38,6 +39,9 @@ public:
 
   /// \return List of names of the drafts in this store.
   std::vector<Path> getActiveFiles() const;
+
+  /// Atomically captures the names, contents, and versions of all drafts.
+  std::vector<std::pair<Path, Draft>> getDrafts() const;
 
   /// Replace contents of the draft for \p File with \p Contents.
   /// If version is empty, one will be automatically assigned.
