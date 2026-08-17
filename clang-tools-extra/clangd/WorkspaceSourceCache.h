@@ -106,10 +106,6 @@ private:
   std::unique_ptr<Impl> State;
 };
 
-/// One-shot inventory for callers that do not own a long-lived cache.
-llvm::Expected<std::vector<WorkspaceSourceFile>>
-workspaceSourceFiles(PathRef WorkspaceRoot, llvm::vfs::FileSystem &FS);
-
 } // namespace clangd
 } // namespace clang
 

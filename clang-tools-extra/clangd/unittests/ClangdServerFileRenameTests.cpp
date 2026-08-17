@@ -15,7 +15,10 @@
 #include "support/Threading.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Testing/Support/Error.h"
 #include "gmock/gmock.h"
@@ -151,8 +154,7 @@ TEST(ClangdServerFileRename, RejectsRenamesIntersectingPrunedMetadata) {
         std::pair<Path, Path>{testPath("nested"), testPath("renamed")}}) {
     EXPECT_THAT_EXPECTED(
         runPrepareFileRename(Server, {{Rename.first, Rename.second}}),
-        llvm::FailedWithMessage(
-            testing::HasSubstr("unscanned metadata root")));
+        llvm::FailedWithMessage(testing::HasSubstr("unscanned metadata root")));
   }
 }
 
@@ -295,15 +297,44 @@ TEST(ClangdServerFileRename, RejectsDestinationOnlyIncludeShadow) {
   Opts.WorkspaceRoot = testRoot();
   ClangdServer Server(CDB, FS, Opts);
   auto Command = commandFor(Main);
-  Command.CommandLine.insert(Command.CommandLine.end() - 1,
-                             {"-I", testPath("first"), "-I",
-                              testPath("second")});
+  Command.CommandLine.insert(
+      Command.CommandLine.end() - 1,
+      {"-I", testPath("first"), "-I", testPath("second")});
   CDB.setCompileCommand(Main, std::move(Command));
   ASSERT_TRUE(Server.blockUntilIdleForTest());
 
   EXPECT_THAT_EXPECTED(
       runPrepareFileRename(Server, {{{Old}, {New}}}),
       llvm::FailedWithMessage(testing::HasSubstr("instead of")));
+}
+
+TEST(ClangdServerFileRename, RejectsDestinationOnlyForcedInputShadow) {
+  for (llvm::StringRef Option : {"-include", "-imacros"}) {
+    SCOPED_TRACE(Option);
+    MockFS FS;
+    const Path Main = testPath("main.cpp");
+    const Path Old = testPath("first/unrelated.h");
+    const Path New = testPath("first/current.h");
+    FS.Files[Main] = "int value;\n";
+    FS.Files[Old] = "";
+    FS.Files[testPath("second/current.h")] = "";
+    MockCompilationDatabase Base(testRoot());
+    OverlayCDB CDB(&Base);
+    auto Opts = ClangdServer::optsForTest();
+    Opts.BackgroundIndex = true;
+    Opts.WorkspaceRoot = testRoot();
+    ClangdServer Server(CDB, FS, Opts);
+    auto Command = commandFor(Main);
+    Command.CommandLine.insert(Command.CommandLine.end() - 1,
+                               {"-I", testPath("first"), "-I",
+                                testPath("second"), Option.str(), "current.h"});
+    CDB.setCompileCommand(Main, std::move(Command));
+    ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+    EXPECT_THAT_EXPECTED(
+        runPrepareFileRename(Server, {{{Old}, {New}}}),
+        llvm::FailedWithMessage(testing::HasSubstr("forced compiler input")));
+  }
 }
 
 TEST(ClangdServerFileRename, RejectsOrphanWorkspaceSource) {
@@ -394,10 +425,9 @@ TEST(ClangdServerFileRename, RejectsAffectedExternalIncluder) {
   CDB.setCompileCommand(Main, commandFor(Main));
   ASSERT_TRUE(Server.blockUntilIdleForTest());
 
-  EXPECT_THAT_EXPECTED(
-      runPrepareFileRename(Server, {{{Old}, {New}}}),
-      llvm::FailedWithMessage(
-          testing::HasSubstr("includer outside the workspace")));
+  EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::FailedWithMessage(testing::HasSubstr(
+                           "includer outside the workspace")));
 }
 
 TEST(ClangdServerFileRename, RejectsStaleExternalGraphNode) {
@@ -452,10 +482,9 @@ TEST(ClangdServerFileRename, RejectsUnresolvedConditionalIncludes) {
 
   auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
   EXPECT_THAT_EXPECTED(
-      Result,
-      llvm::FailedWithMessage(testing::AnyOf(
-          testing::HasSubstr("macro-generated conditional include"),
-          testing::HasSubstr("conditional #include_next"))));
+      Result, llvm::FailedWithMessage(testing::AnyOf(
+                  testing::HasSubstr("macro-generated conditional include"),
+                  testing::HasSubstr("conditional #include_next"))));
 }
 
 TEST(ClangdServerFileRename, RejectsUneditableAssemblyDependency) {
@@ -478,10 +507,9 @@ asm(".incbin \"payload.bin\"");
   CDB.setCompileCommand(Main, commandFor(Main));
   ASSERT_TRUE(Server.blockUntilIdleForTest());
 
-  EXPECT_THAT_EXPECTED(
-      runPrepareFileRename(Server, {{{Old}, {New}}}),
-      llvm::FailedWithMessage(
-          testing::HasSubstr("inline assembly dependency")));
+  EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::FailedWithMessage(
+                           testing::HasSubstr("inline assembly dependency")));
 }
 
 TEST(ClangdServerFileRename, RejectsIncludeAliasContext) {
@@ -511,36 +539,137 @@ TEST(ClangdServerFileRename, RejectsIncludeAliasContext) {
       llvm::FailedWithMessage(testing::HasSubstr("include_alias state")));
 }
 
-TEST(ClangdServerFileRename, RejectsCrossDirectoryConfigurationScope) {
+TEST(ClangdServerFileRename, RejectsExternalImplicitModuleMapDependency) {
+  llvm::SmallString<256> ModuleCache;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory(
+      "clangd-server-file-rename-modules", ModuleCache));
+  llvm::scope_exit Cleanup(
+      [&] { llvm::sys::fs::remove_directories(ModuleCache); });
+
+  llvm::SmallString<256> ExternalInclude(
+      testPath("../clangd-external/include"));
+  llvm::sys::path::remove_dots(ExternalInclude, /*remove_dot_dot=*/true);
+  llvm::SmallString<256> ModuleMap(ExternalInclude);
+  llvm::sys::path::append(ModuleMap, "module.modulemap");
+  const Path Main = testPath("main.m");
+  const Path Old = testPath("old.h");
+  const Path New = testPath("new.h");
+
   MockFS FS;
-  const Path Main = testPath("a/main.cpp");
-  const Path New = testPath("b/main.cpp");
-  FS.Files[Main] = "int value;\n";
-  FS.Files[testPath("b/.keep")] = "";
+  FS.OverlayRealFileSystemForModules = true;
+  FS.Files[Main] = "@import M;\n";
+  FS.Files[Old] = "struct Mapped {};\n";
+  FS.Files[ModuleMap] = ("module M { header \"" + Old + "\" export * }\n");
   MockCompilationDatabase Base(testRoot());
   OverlayCDB CDB(&Base);
   auto Opts = ClangdServer::optsForTest();
   Opts.BackgroundIndex = true;
   Opts.WorkspaceRoot = testRoot();
   ClangdServer Server(CDB, FS, Opts);
-  CDB.setCompileCommand(Main, commandFor(Main));
+  auto Command = commandFor(Main);
+  Command.CommandLine.front() = "clang";
+  Command.CommandLine.insert(Command.CommandLine.end() - 1,
+                             {"-x", "objective-c", "-fmodules",
+                              "-fimplicit-module-maps",
+                              "-fmodules-cache-path=" + ModuleCache.str().str(),
+                              "-I", ExternalInclude.str().str()});
+  CDB.setCompileCommand(Main, std::move(Command));
   ASSERT_TRUE(Server.blockUntilIdleForTest());
 
   EXPECT_THAT_EXPECTED(
-      runPrepareFileRename(Server, {{{Main}, {New}}}),
-      llvm::FailedWithMessage(testing::HasSubstr(
-          "configuration or compilation-database directories")));
+      runPrepareFileRename(Server, {{{Old}, {New}}}),
+      llvm::FailedWithMessage(testing::HasSubstr("module-map dependency")));
+}
+
+TEST(ClangdServerFileRename, MovesDirectoryWithinSameConfigurationScope) {
+  MockFS FS;
+  const Path Consumer = testPath("consumer.cpp");
+  const Path Main = testPath("old/main.cpp");
+  const Path Header = testPath("old/header.h");
+  const Path Old = testPath("old");
+  const Path New = testPath("new");
+  FS.Files[Consumer] = "#include \"old/header.h\"\n";
+  FS.Files[Main] = "#include \"header.h\"\n";
+  FS.Files[Header] = "inline int value;\n";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Consumer, commandFor(Consumer));
+  CDB.setCompileCommand(Main, commandFor(Main));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().textDocument.uri.file(), Consumer);
+  ASSERT_THAT(Result->documentChanges->front().edits, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().edits.front().newText,
+            "\"new/header.h\"");
+}
+
+TEST(ClangdServerFileRename, MovesFileAcrossDirectoriesWithinSameConfig) {
+  MockFS FS;
+  const Path Consumer = testPath("consumer.cpp");
+  const Path Old = testPath("old/main.cpp");
+  const Path New = testPath("new/main.cpp");
+  FS.Files[Consumer] = "#include \"old/main.cpp\"\n";
+  FS.Files[Old] = "int moved_value;\n";
+  FS.Files[testPath("new/.keep")] = "";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  CDB.setCompileCommand(Consumer, commandFor(Consumer));
+  CDB.setCompileCommand(Old, commandFor(Old));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  auto Result = runPrepareFileRename(Server, {{{Old}, {New}}});
+  ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
+  ASSERT_TRUE(Result->documentChanges);
+  ASSERT_THAT(*Result->documentChanges, SizeIs(1));
+  EXPECT_EQ(Result->documentChanges->front().textDocument.uri.file(), Consumer);
+  EXPECT_EQ(Result->documentChanges->front().edits.front().newText,
+            "\"new/main.cpp\"");
+}
+
+TEST(ClangdServerFileRename, RejectsExpandedExecutableShadow) {
+  MockFS FS;
+  const Path Main = testPath("main.c");
+  const Path Stage = testPath("stage");
+  const Path Bin = testPath("bin");
+  FS.Files[Main] = "int value;\n";
+  FS.Files[testPath("stage/clang")] = "compiler payload";
+  MockCompilationDatabase Base(testRoot());
+  OverlayCDB CDB(&Base);
+  auto Opts = ClangdServer::optsForTest();
+  Opts.BackgroundIndex = true;
+  Opts.WorkspaceRoot = testRoot();
+  ClangdServer Server(CDB, FS, Opts);
+  auto Command = commandFor(Main);
+  Command.CommandLine.front() = "clang";
+  CDB.setCompileCommand(Main, std::move(Command));
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+
+  EXPECT_THAT_EXPECTED(
+      runPrepareFileRename(Server, {{{Stage}, {Bin}}}),
+      llvm::FailedWithMessage(testing::HasSubstr("executable resolution")));
 }
 
 TEST(ClangdServerFileRename, RejectsFilenameSpecificDestinationConfig) {
   MockFS FS;
-  const Path Old = testPath("old.cpp");
-  const Path New = testPath("new.cpp");
+  const Path Old = testPath("a/old.cpp");
+  const Path New = testPath("b/new.cpp");
   FS.Files[Old] = "int value;\n";
   auto ContextForFile = [](PathRef File) {
     Config C;
-    std::string Define = File.ends_with("new.cpp") ? "-DDESTINATION"
-                                                    : "-DSOURCE";
+    std::string Define =
+        File.ends_with("new.cpp") ? "-DDESTINATION" : "-DSOURCE";
     C.CompileFlags.Edits.push_back(
         [Define = std::move(Define)](std::vector<std::string> &Argv) {
           Argv = tooling::getInsertArgumentAdjuster(Define.c_str())(Argv, "");
@@ -552,9 +681,7 @@ TEST(ClangdServerFileRename, RejectsFilenameSpecificDestinationConfig) {
   OverlayCDB CDB(
       &Base, {},
       [Mangler = std::move(Mangler)](tooling::CompileCommand &Command,
-                                     PathRef File) {
-        Mangler(Command, File);
-      });
+                                     PathRef File) { Mangler(Command, File); });
   auto Opts = ClangdServer::optsForTest();
   Opts.BackgroundIndex = true;
   Opts.WorkspaceRoot = testRoot();
@@ -563,10 +690,9 @@ TEST(ClangdServerFileRename, RejectsFilenameSpecificDestinationConfig) {
   CDB.setCompileCommand(Old, commandFor(Old));
   ASSERT_TRUE(Server.blockUntilIdleForTest());
 
-  EXPECT_THAT_EXPECTED(
-      runPrepareFileRename(Server, {{{Old}, {New}}}),
-      llvm::FailedWithMessage(
-          testing::HasSubstr("compilation command or configuration changes")));
+  EXPECT_THAT_EXPECTED(runPrepareFileRename(Server, {{{Old}, {New}}}),
+                       llvm::FailedWithMessage(testing::HasSubstr(
+                           "compilation command or configuration changes")));
 }
 
 TEST(ClangdServerFileRename, RejectsDraftChangeDuringPreparation) {

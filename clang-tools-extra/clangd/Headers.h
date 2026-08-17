@@ -97,6 +97,12 @@ struct IncludeGraphNode {
     // -imacros), rather than by a directive in a file. This is meaningful in
     // an exact translation-unit context.
     IsCommandInput = 1 << 3,
+    // The effective preprocessing state contains an include-alias mapping.
+    HasIncludeAliasState = 1 << 4,
+    // An active preprocessing file-existence query was evaluated.
+    HasFileQuery = 1 << 5,
+    // This node is a module map loaded while compiling the owning TU.
+    IsModuleMap = 1 << 6,
   };
 
   SourceFlag Flags = SourceFlag::None;

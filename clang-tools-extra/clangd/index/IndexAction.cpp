@@ -9,6 +9,7 @@
 #include "IndexAction.h"
 #include "AST.h"
 #include "Headers.h"
+#include "SourceCode.h"
 #include "clang-include-cleaner/Record.h"
 #include "index/Relation.h"
 #include "index/Serialization.h"
@@ -22,6 +23,10 @@
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Index/IndexingAction.h"
 #include "clang/Index/IndexingOptions.h"
+#include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/ModuleMap.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Path.h"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -35,9 +40,44 @@ std::optional<std::string> toURI(OptionalFileEntryRef File) {
   if (!File)
     return std::nullopt;
   auto AbsolutePath = File->getFileEntry().tryGetRealPathName();
-  if (AbsolutePath.empty())
-    return std::nullopt;
+  llvm::SmallString<256> Normalized;
+  if (AbsolutePath.empty()) {
+    if (!llvm::sys::path::is_absolute(File->getName()))
+      return std::nullopt;
+    Normalized = File->getName();
+    llvm::sys::path::remove_dots(Normalized, /*remove_dot_dot=*/true);
+    AbsolutePath = Normalized;
+  }
   return URI::create(AbsolutePath).toString();
+}
+
+std::optional<FileDigest> digestFileEntry(const SourceManager &SM,
+                                          FileEntryRef File, FileID FID) {
+  if (FID.isValid())
+    if (auto Digest = digestFile(SM, FID))
+      return Digest;
+  auto Buffer = SM.getFileManager().getBufferForFile(File);
+  if (!Buffer)
+    return std::nullopt;
+  return digest((*Buffer)->getBuffer());
+}
+
+std::optional<llvm::StringRef> recordFileNode(const SourceManager &SM,
+                                              IncludeGraph &IG,
+                                              FileEntryRef File,
+                                              FileID FID = FileID()) {
+  auto URI = toURI(File);
+  if (!URI)
+    return std::nullopt;
+  auto I = IG.try_emplace(*URI).first;
+  IncludeGraphNode &Node = I->getValue();
+  if (Node.URI.data() != I->getKeyData())
+    Node.URI = I->getKey();
+  const FileDigest EmptyDigest{{0}};
+  if (Node.Digest == EmptyDigest)
+    if (auto Digest = digestFileEntry(SM, File, FID))
+      Node.Digest = *Digest;
+  return I->getKey();
 }
 
 // Collects the nodes and edges of include graph during indexing action.
@@ -48,10 +88,7 @@ public:
   IncludeGraphCollector(const SourceManager &SM, IncludeGraph &IG)
       : SM(SM), IG(IG) {}
 
-  // Populates everything except direct includes for a node, which represents
-  // edges in the include graph and populated in inclusion directive.
-  // We cannot populate the fields in InclusionDirective because it does not
-  // have access to the contents of the included file.
+  // Marks entered files and identifies the translation unit.
   void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                    SrcMgr::CharacteristicKind FileType,
                    FileID PrevFID) override {
@@ -62,26 +99,18 @@ public:
 
     const auto FileID = SM.getFileID(Loc);
     auto File = SM.getFileEntryRefForID(FileID);
-    auto URI = toURI(File);
+    if (!File)
+      return;
+    auto URI = recordFileNode(SM, IG, *File, FileID);
     if (!URI)
       return;
-    auto I = IG.try_emplace(*URI).first;
-
-    auto &Node = I->getValue();
-    // Node has already been populated.
-    if (Node.URI.data() == I->getKeyData()) {
+    IncludeGraphNode &Node = IG.find(*URI)->getValue();
 #ifndef NDEBUG
-      auto Digest = digestFile(SM, FileID);
-      assert(Digest && Node.Digest == *Digest &&
-             "Same file, different digest?");
+    auto Digest = digestFile(SM, FileID);
+    assert(Digest && Node.Digest == *Digest && "Same file, different digest?");
 #endif
-      return;
-    }
-    if (auto Digest = digestFile(SM, FileID))
-      Node.Digest = std::move(*Digest);
     if (FileID == SM.getMainFileID())
       Node.Flags |= IncludeGraphNode::SourceFlag::IsTU;
-    Node.URI = I->getKey();
   }
 
   // Add edges from including files to includes.
@@ -92,7 +121,9 @@ public:
                           llvm::StringRef RelativePath,
                           const Module *SuggestedModule, bool ModuleImported,
                           SrcMgr::CharacteristicKind FileType) override {
-    auto IncludeURI = toURI(File);
+    if (!File)
+      return;
+    auto IncludeURI = recordFileNode(SM, IG, *File);
     if (!IncludeURI)
       return;
 
@@ -104,7 +135,7 @@ public:
       return;
     }
 
-    auto NodeForInclude = IG.try_emplace(*IncludeURI).first->getKey();
+    auto NodeForInclude = *IncludeURI;
     auto NodeForIncluding = IG.try_emplace(*IncludingURI);
 
     NodeForIncluding.first->getValue().DirectIncludes.push_back(NodeForInclude);
@@ -122,6 +153,38 @@ public:
     assert(I.first->getKeyData() == I.first->getValue().URI.data() &&
            "Node have not been populated yet");
 #endif
+  }
+
+  void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                  OptionalFileEntryRef File,
+                  SrcMgr::CharacteristicKind FileType) override {
+    auto URI =
+        toURI(SM.getFileEntryRefForID(SM.getFileID(SM.getExpansionLoc(Loc))));
+    if (!URI)
+      return;
+    auto Node = IG.find(*URI);
+    if (Node != IG.end())
+      Node->getValue().Flags |= IncludeGraphNode::SourceFlag::HasFileQuery;
+  }
+
+private:
+  const SourceManager &SM;
+  IncludeGraph &IG;
+};
+
+struct ModuleMapCollector : public ModuleMapCallbacks {
+  ModuleMapCollector(const SourceManager &SM, IncludeGraph &IG)
+      : SM(SM), IG(IG) {}
+
+  void moduleMapFileRead(SourceLocation FileStart, FileEntryRef File,
+                         bool IsSystem) override {
+    FileID FID =
+        FileStart.isValid() ? SM.getFileID(FileStart) : SM.translateFile(File);
+    auto URI = recordFileNode(SM, IG, File, FID);
+    if (!URI)
+      return;
+    IncludeGraphNode &Node = IG.find(*URI)->getValue();
+    Node.Flags |= IncludeGraphNode::SourceFlag::IsModuleMap;
   }
 
 private:
@@ -163,6 +226,9 @@ public:
     PI->record(CI.getPreprocessor());
     CI.getPreprocessor().addPPCallbacks(
         std::make_unique<IncludeGraphCollector>(CI.getSourceManager(), IG));
+    HeaderSearchInfo = &CI.getPreprocessor().getHeaderSearchInfo();
+    HeaderSearchInfo->getModuleMap().addModuleMapCallbacks(
+        std::make_unique<ModuleMapCollector>(CI.getSourceManager(), IG));
 
     return index::createIndexingASTConsumer(Collector, Opts,
                                             CI.getPreprocessorPtr());
@@ -184,6 +250,11 @@ public:
   }
 
   void EndSourceFileAction() override {
+    if (HeaderSearchInfo && HeaderSearchInfo->HasIncludeAliasMap())
+      for (auto &Node : IG)
+        if (Node.getValue().Flags & IncludeGraphNode::SourceFlag::IsTU)
+          Node.getValue().Flags |=
+              IncludeGraphNode::SourceFlag::HasIncludeAliasState;
     IndexFileIn Result;
     Result.Symbols = Collector->takeSymbols();
     Result.Refs = Collector->takeRefs();
@@ -203,6 +274,7 @@ private:
   std::unique_ptr<include_cleaner::PragmaIncludes> PI;
   index::IndexingOptions Opts;
   IncludeGraph IG;
+  HeaderSearch *HeaderSearchInfo = nullptr;
 };
 
 } // namespace

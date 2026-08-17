@@ -15,6 +15,9 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <string>
@@ -176,6 +179,46 @@ TEST_F(IndexActionTest, IncludeGraphRecordsCommandLineIncludes) {
           Pair(toUri(MacrosHeaderPath),
                AllOf(Not(isTU()), isCommandInput(), includesAre({}),
                      hasDigest(digest("#define FROM_MACROS 1"))))));
+}
+
+TEST_F(IndexActionTest, IncludeGraphRecordsEffectiveDependencyState) {
+  std::string MainFilePath = testPath("main.cpp");
+  std::string MainCode = R"cpp(
+#define CAT_IMPL(a, b) a ## b
+#define CAT(a, b) CAT_IMPL(a, b)
+#if CAT(__has_, include)("missing.h")
+#endif
+#define APPLY_ALIAS _Pragma("include_alias(\"old.h\", \"new.h\")")
+APPLY_ALIAS
+)cpp";
+  addFile(MainFilePath, MainCode);
+
+  IndexFileIn IndexFile = runIndexingAction(MainFilePath, {"-fms-extensions"});
+  const auto &Main = IndexFile.Sources->lookup(toUri(MainFilePath));
+  EXPECT_TRUE(Main.Flags & IncludeGraphNode::SourceFlag::HasFileQuery);
+  EXPECT_TRUE(Main.Flags & IncludeGraphNode::SourceFlag::HasIncludeAliasState);
+}
+
+TEST_F(IndexActionTest, IncludeGraphRecordsLoadedImplicitModuleMap) {
+  std::string MainFilePath = testPath("main.cpp");
+  std::string IncludeDir = testPath("include");
+  std::string Header = testPath("include/mapped.h");
+  std::string ModuleMap = testPath("include/module.modulemap");
+  llvm::SmallString<256> Cache;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory(
+      "clangd-index-action-module-cache", Cache));
+  llvm::scope_exit Cleanup([&] { llvm::sys::fs::remove_directories(Cache); });
+  addFile(MainFilePath, "#include <mapped.h>\n");
+  addFile(Header, "struct Mapped {};\n");
+  addFile(ModuleMap, "module M { header \"mapped.h\" export * }\n");
+
+  IndexFileIn IndexFile = runIndexingAction(
+      MainFilePath,
+      {"-fmodules", "-fimplicit-module-maps",
+       "-fmodules-cache-path=" + Cache.str().str(), "-I", IncludeDir});
+  const auto &Map = IndexFile.Sources->lookup(toUri(ModuleMap));
+  EXPECT_TRUE(Map.Flags & IncludeGraphNode::SourceFlag::IsModuleMap);
+  EXPECT_EQ(Map.Digest, digest("module M { header \"mapped.h\" export * }\n"));
 }
 
 TEST_F(IndexActionTest, IncludeGraphSelfInclude) {

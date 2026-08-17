@@ -22,6 +22,8 @@
 
 namespace clang {
 class HeaderSearch;
+class LangOptions;
+class SourceManager;
 namespace clangd {
 
 struct FileRenameMapping {
@@ -76,10 +78,6 @@ scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS);
 llvm::Expected<std::vector<ConditionalInclusion>>
 conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS);
 
-/// Reports whether a file contains any textual inclusion directive.
-llvm::Expected<bool> hasIncludeDirectives(PathRef File,
-                                          llvm::vfs::FileSystem &FS);
-
 /// Rejects renames that move compiler search/configuration paths.
 llvm::Error validateCompileCommandForRenames(
     const tooling::CompileCommand &Command,
@@ -101,7 +99,8 @@ llvm::Error validateCompatibleFileRenameEdits(PathRef File,
 /// macro-generated or otherwise non-literal operands are rejected.
 llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
     PathRef File, llvm::StringRef Code, const IncludeStructure &Includes,
-    HeaderSearch &HeaderSearchInfo, PathRef BuildDir,
+    HeaderSearch &HeaderSearchInfo, const SourceManager &SourceMgr,
+    const LangOptions &LangOpts, PathRef BuildDir,
     llvm::ArrayRef<FileRenameMapping> Renames, const format::FormatStyle &Style,
     llvm::vfs::FileSystem &FS);
 

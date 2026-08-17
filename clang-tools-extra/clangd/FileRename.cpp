@@ -12,6 +12,7 @@
 #include "SourceCode.h"
 #include "support/Logger.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Options/Options.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -27,15 +28,6 @@
 
 namespace clang {
 namespace clangd {
-
-bool fileRenamePathInside(PathRef Ancestor, PathRef Path) {
-  if (Ancestor == Path)
-    return true;
-  if (!Path.starts_with(Ancestor))
-    return false;
-  return Path.size() > Ancestor.size() &&
-         llvm::sys::path::is_separator(Path[Ancestor.size()]);
-}
 
 llvm::Expected<Path> fileRenameCanonicalPath(PathRef Path,
                                              llvm::vfs::FileSystem &FS) {
@@ -79,7 +71,7 @@ llvm::Error checkInsideWorkspace(PathRef Path, PathRef CanonicalWorkspaceRoot,
   auto Real = fileRenameCanonicalPath(Path, FS);
   if (!Real)
     return Real.takeError();
-  if (!fileRenamePathInside(CanonicalWorkspaceRoot, *Real))
+  if (!pathStartsWith(CanonicalWorkspaceRoot, *Real))
     return error("file rename path is outside the workspace: {0}", Path);
   return llvm::Error::success();
 }
@@ -103,7 +95,7 @@ llvm::Error checkDestination(PathRef OldPath, PathRef NewPath,
     auto RealNew = fileRenameCanonicalPath(NewPath, FS);
     if (!RealNew)
       return RealNew.takeError();
-    if (*RealOld != *RealNew ||
+    if (!pathEqual(*RealOld, *RealNew) ||
         Existing->getUniqueID() != OldStatus.getUniqueID())
       return error("rename destination already exists: {0}", NewPath);
   } else if (Existing.getError() != std::errc::no_such_file_or_directory) {
@@ -244,23 +236,60 @@ literalOperandRange(const Inclusion &Inc, llvm::StringRef Code) {
   return std::pair<size_t, size_t>{Pos, Pos + Inc.Written.size()};
 }
 
-llvm::Error verifyNewIncludeResolution(llvm::StringRef Written,
-                                       PathRef IncludingFile, PathRef NewTarget,
-                                       HeaderSearch &HeaderSearchInfo,
-                                       PathRef BuildDir,
-                                       llvm::ArrayRef<FileRenameMapping> Renames,
-                                       llvm::vfs::FileSystem &FS) {
-  if (Written.size() < 2 ||
-      !((Written.front() == '"' && Written.back() == '"') ||
-        (Written.front() == '<' && Written.back() == '>')))
+llvm::Expected<std::string>
+interpretedHeaderName(llvm::StringRef Written, const SourceManager &SourceMgr,
+                      const LangOptions &LangOpts) {
+  std::string Directive = ("#include " + Written + "\n").str();
+  Lexer Lex(SourceLocation(), LangOpts, Directive.data(), Directive.data(),
+            Directive.data() + Directive.size());
+  Token Tok;
+  Lex.LexFromRawLexer(Tok);
+  if (Tok.isNot(tok::hash))
+    return error("calculated include does not form a directive: {0}", Written);
+  Lex.setParsingPreprocessorDirective(true);
+  Lex.LexFromRawLexer(Tok);
+  if (Tok.isNot(tok::raw_identifier) || Tok.getRawIdentifier() != "include")
+    return error("calculated include does not form an include directive: {0}",
+                 Written);
+  Lex.LexIncludeFilename(Tok);
+  if (Tok.isNot(tok::header_name))
+    return error("calculated include does not form one header-name token: {0}",
+                 Written);
+  llvm::SmallString<256> SpellingStorage;
+  SpellingStorage.resize(Tok.getLength());
+  const char *Spelling = SpellingStorage.data();
+  bool Invalid = false;
+  unsigned SpellingLength =
+      Lexer::getSpelling(Tok, Spelling, SourceMgr, LangOpts, &Invalid);
+  if (Invalid)
+    return error("cannot interpret calculated include header name: {0}",
+                 Written);
+  std::string Result(Spelling, SpellingLength);
+  Lex.LexFromRawLexer(Tok);
+  if (Tok.isNot(tok::eod) && Tok.isNot(tok::eof))
+    return error("calculated include does not form one header-name token: {0}",
+                 Written);
+  return Result;
+}
+
+llvm::Error verifyNewIncludeResolution(
+    llvm::StringRef Written, PathRef IncludingFile, PathRef NewTarget,
+    HeaderSearch &HeaderSearchInfo, const SourceManager &SourceMgr,
+    const LangOptions &LangOpts, PathRef BuildDir,
+    llvm::ArrayRef<FileRenameMapping> Renames, llvm::vfs::FileSystem &FS) {
+  auto Interpreted = interpretedHeaderName(Written, SourceMgr, LangOpts);
+  if (!Interpreted)
+    return Interpreted.takeError();
+  llvm::StringRef Header = *Interpreted;
+  if (Header.size() < 2 || !((Header.front() == '"' && Header.back() == '"') ||
+                             (Header.front() == '<' && Header.back() == '>')))
     return error("calculated include is not a literal: {0}", Written);
-  bool Quoted = Written.front() == '"';
-  llvm::StringRef Name = Written.drop_front().drop_back();
+  bool Quoted = Header.front() == '"';
+  llvm::StringRef Name = Header.drop_front().drop_back();
   if (llvm::sys::path::is_absolute(Name))
     return error("calculated include path is absolute: {0}", Written);
 
-  auto IdentityAfterRename =
-      [&](PathRef RawPath)
+  auto IdentityAfterRename = [&](PathRef RawPath)
       -> llvm::Expected<std::optional<llvm::sys::fs::UniqueID>> {
     llvm::SmallString<256> Path(RawPath);
     llvm::sys::path::remove_dots(Path, /*remove_dot_dot=*/true);
@@ -341,8 +370,8 @@ std::optional<std::string> relativeIncludePath(PathRef IncludingFile,
   llvm::SmallString<256> Destination(Target);
   llvm::sys::path::remove_dots(Base, /*remove_dot_dot=*/true);
   llvm::sys::path::remove_dots(Destination, /*remove_dot_dot=*/true);
-  if (llvm::sys::path::root_name(Base) !=
-          llvm::sys::path::root_name(Destination) ||
+  if (!pathEqual(llvm::sys::path::root_name(Base),
+                 llvm::sys::path::root_name(Destination)) ||
       llvm::sys::path::has_root_directory(Base) !=
           llvm::sys::path::has_root_directory(Destination))
     return std::nullopt;
@@ -352,7 +381,7 @@ std::optional<std::string> relativeIncludePath(PathRef IncludingFile,
   auto DestinationIt = llvm::sys::path::begin(Destination);
   auto DestinationEnd = llvm::sys::path::end(Destination);
   while (BaseIt != BaseEnd && DestinationIt != DestinationEnd &&
-         *BaseIt == *DestinationIt) {
+         pathEqual(*BaseIt, *DestinationIt)) {
     ++BaseIt;
     ++DestinationIt;
   }
@@ -398,7 +427,7 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
       return std::move(Err);
     if (auto Err = checkInsideWorkspace(*New, *CanonicalRoot, FS))
       return std::move(Err);
-    if (*Old == *New)
+    if (pathEqual(*Old, *New))
       return error("rename source and destination are identical: {0}", *Old);
 
     auto OldStatus = status(*Old, FS);
@@ -418,7 +447,7 @@ expandFileRenames(llvm::ArrayRef<std::pair<Path, Path>> Renames,
     auto CanonicalNew = fileRenameCanonicalPath(*New, FS);
     if (!CanonicalNew)
       return CanonicalNew.takeError();
-    if (fileRenamePathInside(*CanonicalOld, *CanonicalNew))
+    if (pathStartsWith(*CanonicalOld, *CanonicalNew))
       return error("rename destination is inside its source directory: {0}",
                    *New);
     if (auto Err = checkDestination(*Old, *New, *OldStatus, FS))
@@ -485,7 +514,8 @@ llvm::Error validateCompatibleFileRenameEdits(PathRef File,
 
 llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
     PathRef File, llvm::StringRef Code, const IncludeStructure &Includes,
-    HeaderSearch &HeaderSearchInfo, PathRef BuildDir,
+    HeaderSearch &HeaderSearchInfo, const SourceManager &SourceMgr,
+    const LangOptions &LangOpts, PathRef BuildDir,
     llvm::ArrayRef<FileRenameMapping> Renames, const format::FormatStyle &Style,
     llvm::vfs::FileSystem &FS) {
   Path EffectiveFile = File.str();
@@ -499,7 +529,7 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
                                                   FileStatus->getUniqueID();
                                          });
       MovedIncluder != Renames.end()) {
-    if (File != MovedIncluder->OldPath)
+    if (!pathEqual(File, MovedIncluder->OldPath))
       return error("cannot disambiguate moved includer {0} from filesystem "
                    "alias {1}",
                    MovedIncluder->OldPath, File);
@@ -510,7 +540,7 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
                            &HeaderSearchInfo,
                            Config::current().Style.QuotedHeaders,
                            Config::current().Style.AngledHeaders);
-  bool IncluderMoved = EffectiveFile != File;
+  bool IncluderMoved = !pathEqual(EffectiveFile, File);
   std::vector<TextEdit> Result;
   for (const Inclusion &Inc : Includes.MainFileIncludes) {
     if (Inc.Resolved.empty())
@@ -525,14 +555,14 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
           return Candidate.OldIdentity == IncludedStatus->getUniqueID();
         });
     if (RenamedTarget != Renames.end() &&
-        Inc.Resolved != RenamedTarget->OldPath)
+        !pathEqual(Inc.Resolved, RenamedTarget->OldPath))
       return error("cannot disambiguate renamed include {0} from filesystem "
                    "alias {1}",
                    RenamedTarget->OldPath, Inc.Resolved);
     if (RenamedTarget == Renames.end() && !IncluderMoved) {
       if (auto Err = verifyNewIncludeResolution(
               Inc.Written, EffectiveFile, Inc.Resolved, HeaderSearchInfo,
-              BuildDir, Renames, FS))
+              SourceMgr, LangOpts, BuildDir, Renames, FS))
         return std::move(Err);
       continue;
     }
@@ -559,21 +589,9 @@ llvm::Expected<std::vector<TextEdit>> renameIncludeDirectives(
       NewWritten->front() = '"';
       NewWritten->back() = '"';
     }
-    llvm::StringRef NewSpelling = *NewWritten;
-    if (NewSpelling.size() < 2 ||
-        ((NewSpelling.front() != '"' || NewSpelling.back() != '"') &&
-         (NewSpelling.front() != '<' || NewSpelling.back() != '>')) ||
-        NewSpelling.drop_front().drop_back().contains(
-            NewSpelling.front() == '"' ? '"' : '>') ||
-        NewSpelling.contains('\n') || NewSpelling.contains('\r') ||
-        NewSpelling.contains('\0'))
-      return error("cannot represent renamed include path {0} as a valid "
-                   "header-name token",
-                   NewTarget);
-    if (auto Err =
-            verifyNewIncludeResolution(*NewWritten, EffectiveFile, NewTarget,
-                                       HeaderSearchInfo, BuildDir, Renames,
-                                       FS))
+    if (auto Err = verifyNewIncludeResolution(
+            *NewWritten, EffectiveFile, NewTarget, HeaderSearchInfo, SourceMgr,
+            LangOpts, BuildDir, Renames, FS))
       return std::move(Err);
     if (*NewWritten == Inc.Written)
       continue;

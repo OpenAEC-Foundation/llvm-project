@@ -96,6 +96,39 @@ TEST(FileRenameDirectiveCache, FailedFrozenDigestCheckDoesNotCommit) {
   EXPECT_EQ(TFS.reads(File), 2U);
 }
 
+TEST(FileRenameDirectiveCache, RejectsOversizedScanBeforeOpeningFile) {
+  CountingFileSystem TFS;
+  const Path File = testPath("external/huge.h");
+  TFS.Files[File] = std::string(1024, 'x');
+  auto FS = TFS.view(std::nullopt);
+  FileRenameDirectiveCache Cache(*FS);
+
+  EXPECT_THAT_EXPECTED(
+      Cache.scan(File, digest(TFS.Files.lookup(File)), 16),
+      llvm::FailedWithMessage(testing::HasSubstr("scan limit")));
+  EXPECT_EQ(TFS.reads(File), 0U);
+}
+
+TEST(FileRenameDirectiveCache, DecodesCompleteInlineAssemblyTemplate) {
+  for (llvm::StringRef Code : {
+           "asm(\".inc\" \"bin \\\"joined.bin\\\"\");\n",
+           "asm(\"\\x2eincbin \\\"escaped.bin\\\"\");\n",
+       }) {
+    SCOPED_TRACE(Code);
+    MockFS TFS;
+    const Path File = testPath("assembly.cpp");
+    TFS.Files[File] = Code;
+    auto FS = TFS.view(std::nullopt);
+    auto Scan = scanFileRenameDirectives(File, *FS);
+    ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
+    EXPECT_TRUE(llvm::any_of(Scan->UneditableDependencies,
+                             [](const UneditableFileDependency &Dependency) {
+                               return Dependency.Kind ==
+                                      "unproven inline assembly dependency";
+                             }));
+  }
+}
+
 TEST(FileRenameDirectiveCache, TreatsIncludeGuardsAsConditional) {
   MockFS TFS;
   const Path File = testPath("guarded.h");
@@ -123,7 +156,17 @@ TEST(FileRenameDirectiveCache, FindsUneditableDependencyForms) {
 import "unit.h";
 #pragma GCC dependency "stamp"
 _Pragma("clang dependency \"other-stamp\"")
+#define DEP "clang dependency \"macro-stamp\""
+_Pragma(DEP)
+#define MS_PRAGMA __pragma
+MS_PRAGMA(include_alias("old.h", "new.h"))
+#define CAT_IMPL(a, b) a ## b
+#define CAT(a, b) CAT_IMPL(a, b)
+#if CAT(__has_, include)("pasted.h")
+#endif
 asm(".incbin \"payload.bin\"");
+asm(".inc" "bin \"joined.bin\"");
+asm(".inc\\x62in \"escaped.bin\"");
 )cpp";
   auto FS = TFS.view(std::nullopt);
   auto Scan = scanFileRenameDirectives(Source, *FS);
@@ -131,12 +174,32 @@ asm(".incbin \"payload.bin\"");
   for (llvm::StringRef Kind :
        {"__has_include", "#embed directive", "C++ header-unit import",
         "dependency pragma", "_Pragma dependency",
-        "unproven inline assembly dependency"})
+        "macro token-pasting construct", "unproven inline assembly dependency"})
     EXPECT_TRUE(llvm::any_of(Scan->UneditableDependencies,
                              [&](const UneditableFileDependency &Dependency) {
                                return Dependency.Kind == Kind;
                              }))
         << Kind.str();
+}
+
+TEST(FileRenameDirectiveCache, FindsInactiveTokenPastedFileQuery) {
+  MockFS TFS;
+  const Path Source = testPath("inactive-query.cpp");
+  TFS.Files[Source] = R"cpp(
+#if 0
+#define CAT_IMPL(a, b) a ## b
+#if CAT_IMPL(__has_, include)("optional.h")
+#endif
+#endif
+)cpp";
+  auto FS = TFS.view(std::nullopt);
+  auto Scan = scanFileRenameDirectives(Source, *FS);
+  ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
+  EXPECT_TRUE(llvm::any_of(Scan->UneditableDependencies,
+                           [](const UneditableFileDependency &Dependency) {
+                             return Dependency.Kind ==
+                                    "macro token-pasting construct";
+                           }));
 }
 
 TEST(FileRenameDirectiveCache, FindsModuleMapDependencies) {
@@ -145,7 +208,11 @@ TEST(FileRenameDirectiveCache, FindsModuleMapDependencies) {
   TFS.Files[ModuleMap] = R"modulemap(
 module Example {
   header "header.h"
+  private header "private.h"
+  textual header "textual.h"
+  exclude header "excluded.h"
   umbrella "include"
+  umbrella header "umbrella.h"
   extern module Other "other.modulemap"
 }
 )modulemap";
@@ -154,11 +221,15 @@ module Example {
   ASSERT_THAT_EXPECTED(Scan, llvm::Succeeded());
   EXPECT_THAT(
       Scan->UneditableDependencies,
-      testing::Contains(testing::AllOf(
-          testing::Field(&UneditableFileDependency::Kind,
-                         "module-map dependency"),
-          testing::Field(&UneditableFileDependency::Written,
-                         "\"other.modulemap\""))));
+      testing::ElementsAre(
+          testing::FieldsAre("module-map dependency", "\"header.h\"", false),
+          testing::FieldsAre("module-map dependency", "\"private.h\"", false),
+          testing::FieldsAre("module-map dependency", "\"textual.h\"", false),
+          testing::FieldsAre("module-map dependency", "\"excluded.h\"", false),
+          testing::FieldsAre("module-map dependency", "\"include\"", true),
+          testing::FieldsAre("module-map dependency", "\"umbrella.h\"", false),
+          testing::FieldsAre("module-map dependency", "\"other.modulemap\"",
+                             false)));
 }
 
 } // namespace

@@ -32,16 +32,75 @@ namespace {
 
 bool commandMatchesFileRenameSnapshot(const tooling::CompileCommand &Current,
                                       const tooling::CompileCommand &Expected) {
-  return Current.Directory == Expected.Directory &&
-         Current.CommandLine == Expected.CommandLine &&
-         Current.HadResponseFile == Expected.HadResponseFile &&
-         Current.HadConfigFile == Expected.HadConfigFile;
+  return Current == Expected;
 }
 
 bool renameSetIsNoop(llvm::ArrayRef<std::pair<Path, Path>> Renames) {
   return Renames.empty() || llvm::all_of(Renames, [](const auto &Rename) {
-           return removeDots(Rename.first) == removeDots(Rename.second);
+           return pathEqual(removeDots(Rename.first),
+                            removeDots(Rename.second));
          });
+}
+
+bool pathWithinRenameNamespace(PathRef RawPath,
+                               llvm::ArrayRef<std::pair<Path, Path>> Renames) {
+  Path Normalized = removeDots(RawPath);
+  if (!llvm::sys::path::is_absolute(Normalized))
+    return true;
+  return llvm::any_of(Renames, [&](const auto &Rename) {
+    Path Old = removeDots(Rename.first);
+    Path New = removeDots(Rename.second);
+    if (!llvm::sys::path::is_absolute(Old) ||
+        !llvm::sys::path::is_absolute(New))
+      return true;
+    return pathStartsWith(Old, Normalized) || pathStartsWith(New, Normalized);
+  });
+}
+
+Path absoluteCommandPath(PathRef RawPath, PathRef BaseDirectory) {
+  llvm::SmallString<256> Result(RawPath);
+  if (!llvm::sys::path::is_absolute(Result)) {
+    Result = BaseDirectory;
+    llvm::sys::path::append(Result, RawPath);
+  }
+  llvm::sys::path::remove_dots(Result, /*remove_dot_dot=*/true);
+  return Result.str().str();
+}
+
+bool unparsedArgumentsMayIntersectRenames(
+    const tooling::CompileCommand &Command, PathRef EffectiveDirectory,
+    llvm::ArrayRef<std::pair<Path, Path>> Renames) {
+  auto CandidateIntersects = [&](llvm::StringRef Raw) {
+    Raw = Raw.trim(" \t\"'");
+    if (Raw.consume_front("@"))
+      Raw = Raw.trim(" \t\"'");
+    if (Raw.empty())
+      return false;
+    if (llvm::sys::path::is_absolute(Raw) ||
+        llvm::sys::path::has_parent_path(Raw))
+      return pathWithinRenameNamespace(
+          absoluteCommandPath(Raw, EffectiveDirectory), Renames);
+    return llvm::any_of(Renames, [&](const auto &Rename) {
+      return pathEqual(Raw, llvm::sys::path::filename(Rename.first)) ||
+             pathEqual(Raw, llvm::sys::path::filename(Rename.second));
+    });
+  };
+
+  for (llvm::StringRef Argument : Command.CommandLine) {
+    llvm::SmallVector<llvm::StringRef> Pieces;
+    Argument.split(Pieces, ",;=", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+    for (llvm::StringRef Piece : Pieces) {
+      if (CandidateIntersects(Piece))
+        return true;
+      // Joined options such as -I/path keep the option spelling and path in
+      // one piece. An absolute suffix is still unambiguous.
+      size_t Root = Piece.find(llvm::sys::path::get_separator());
+      if (Root != llvm::StringRef::npos &&
+          CandidateIntersects(Piece.drop_front(Root)))
+        return true;
+    }
+  }
+  return false;
 }
 
 } // namespace
@@ -130,27 +189,30 @@ OverlayCDB::buildRenamePlanLocked(
 
   auto Invalidate = [&](PathRef OldKey, PathRef NewKey) {
     Plan->ChangedFiles.push_back(OldKey.str());
-    if (OldKey != NewKey)
+    if (!pathEqual(OldKey, NewKey))
       Plan->ChangedFiles.push_back(NewKey.str());
   };
 
-  auto Rewrite = [&](tooling::CompileCommand &Command,
-                     const CompilerInputArgument &Span, PathRef NewBase,
-                     PathRef Mapped) {
-    std::string &Argument = Command.CommandLine[Span.ArgumentIndex];
-    llvm::StringRef OldValue(Argument.data() + Span.ValueOffset,
-                             Span.ValueLength);
-    std::string Replacement = Mapped.str();
-    if (!llvm::sys::path::is_absolute(OldValue)) {
-      llvm::SmallString<256> Preserved(NewBase);
-      llvm::sys::path::append(Preserved, OldValue);
-      llvm::sys::path::remove_dots(Preserved, /*remove_dot_dot=*/true);
-      if (pathEqual(Preserved, Mapped))
-        Replacement = OldValue.str();
-      else if (pathEqual(llvm::sys::path::parent_path(Mapped), NewBase))
-        Replacement = llvm::sys::path::filename(Mapped).str();
+  auto AddCommand = [&](PathRef OldKey, PathRef NewKey,
+                        tooling::CompileCommand Command, bool CommandChanged) {
+    if (CollidingDestinations.contains(NewKey)) {
+      Invalidate(OldKey, NewKey);
+      return;
     }
-    Argument.replace(Span.ValueOffset, Span.ValueLength, Replacement);
+    if (!Plan->Commands.try_emplace(NewKey, std::move(Command)).second) {
+      Invalidate(OldKey, NewKey);
+      Invalidate(PlannedOrigins.lookup(NewKey), NewKey);
+      Plan->Commands.erase(NewKey);
+      PlannedOrigins.erase(NewKey);
+      CollidingDestinations.insert(NewKey);
+      return;
+    }
+    PlannedOrigins[NewKey] = OldKey.str();
+    if (!pathEqual(OldKey, NewKey) || CommandChanged) {
+      Plan->ChangedFiles.push_back(OldKey.str());
+      if (!pathEqual(OldKey, NewKey))
+        Plan->ChangedFiles.push_back(NewKey.str());
+    }
   };
 
   for (const auto &Entry : Commands) {
@@ -178,61 +240,65 @@ OverlayCDB::buildRenamePlanLocked(
               Entry.first());
       }
     }
-    // First prove that the original command is classifiable in isolation.
-    // Paths that move with the command (notably its working directory and
-    // source operands) are rewritten below, so validating them against the
-    // rename before rewriting would reject migrations we can preserve.
-    if (auto Err = validateCompileCommandForRenames(RawCommand, {}, {},
-                                                    nullptr, {})) {
-      vlog("Invalidating unprovable overlay command {0} during file rename: "
-           "{1}",
-           Entry.first(), llvm::toString(std::move(Err)));
-      Invalidate(Entry.first(), *NewKey);
+    auto Normalized = normalizeCompilerCommand(Command);
+    bool StructurallyAffected =
+        !pathEqual(*NewKey, Entry.first()) ||
+        pathWithinRenameNamespace(Command.Directory, Renames);
+    Path EffectiveDirectory = Command.Directory;
+    if (Normalized) {
+      EffectiveDirectory = Normalized->EffectiveDirectory;
+      StructurallyAffected |=
+          pathWithinRenameNamespace(Normalized->EffectiveDirectory, Renames);
+      StructurallyAffected |= llvm::any_of(
+          Normalized->Inputs, [&](const CompilerInputArgument &Input) {
+            return pathWithinRenameNamespace(Input.AbsolutePath, Renames);
+          });
+    }
+    if (!Command.Filename.empty())
+      StructurallyAffected |= pathWithinRenameNamespace(
+          absoluteCommandPath(Command.Filename, Command.Directory), Renames);
+
+    std::string OriginalProofFailure;
+    if (auto Err =
+            validateCompileCommandForRenames(RawCommand, {}, {}, nullptr, {}))
+      OriginalProofFailure = llvm::toString(std::move(Err));
+    if (OriginalProofFailure.empty() && !StructurallyAffected) {
+      if (auto Err = validateCompileCommandForRenames(RawCommand, Renames, {},
+                                                      nullptr, {})) {
+        llvm::consumeError(std::move(Err));
+        StructurallyAffected = true;
+      }
+    }
+    if (!OriginalProofFailure.empty() && !StructurallyAffected)
+      StructurallyAffected = unparsedArgumentsMayIntersectRenames(
+          Command, EffectiveDirectory, Renames);
+    if (!StructurallyAffected) {
+      AddCommand(Entry.first(), Entry.first(), std::move(Command),
+                 /*CommandChanged=*/false);
+      if (!Normalized)
+        llvm::consumeError(Normalized.takeError());
       continue;
     }
-    auto Normalized = normalizeCompilerCommand(Command);
-    if (!Normalized) {
-      vlog("Invalidating unclassifiable overlay command {0} during file "
+    if (!OriginalProofFailure.empty()) {
+      vlog("Invalidating affected unprovable overlay command {0} during file "
            "rename: {1}",
+           Entry.first(), OriginalProofFailure);
+      Invalidate(Entry.first(), *NewKey);
+      if (!Normalized)
+        llvm::consumeError(Normalized.takeError());
+      continue;
+    }
+    if (!Normalized) {
+      vlog("Invalidating affected unclassifiable overlay command {0} during "
+           "file rename: {1}",
            Entry.first(), llvm::toString(Normalized.takeError()));
       Invalidate(Entry.first(), *NewKey);
       continue;
     }
-    auto NewDirectory = mapPathAfterRenames(Command.Directory, Renames);
-    if (!NewDirectory)
-      return NewDirectory.takeError();
-    auto NewEffective =
-        mapPathAfterRenames(Normalized->EffectiveDirectory, Renames);
-    if (!NewEffective)
-      return NewEffective.takeError();
-    for (const CompilerInputArgument &Input : Normalized->Inputs) {
-      auto Mapped = mapPathAfterRenames(Input.AbsolutePath, Renames);
-      if (!Mapped)
-        return Mapped.takeError();
-      Rewrite(Command, Input, *NewEffective, *Mapped);
-    }
-    if (Normalized->WorkingDirectory) {
-      auto Mapped =
-          mapPathAfterRenames(Normalized->WorkingDirectory->AbsolutePath,
-                              Renames);
-      if (!Mapped)
-        return Mapped.takeError();
-      Rewrite(Command, *Normalized->WorkingDirectory, *NewDirectory, *Mapped);
-    }
-    if (!Command.Filename.empty()) {
-      llvm::SmallString<256> Filename(Command.Filename);
-      if (!llvm::sys::path::is_absolute(Filename)) {
-        Filename = Command.Directory;
-        llvm::sys::path::append(Filename, Command.Filename);
-      }
-      llvm::sys::path::remove_dots(Filename, /*remove_dot_dot=*/true);
-      auto Mapped = mapPathAfterRenames(Filename, Renames);
-      if (!Mapped)
-        return Mapped.takeError();
-      if (!pathEqual(Filename, *Mapped))
-        Command.Filename = *Mapped;
-    }
-    Command.Directory = *NewDirectory;
+    auto Projected = projectCompileCommandAfterRenames(Command, Renames);
+    if (!Projected)
+      return Projected.takeError();
+    Command = std::move(*Projected);
     tooling::CompileCommand PlannedRaw = Command;
     expandResponseFileProvenance(PlannedRaw);
     PlannedRaw.HadConfigFile |= compilerLoadsConfigFile(PlannedRaw);
@@ -256,24 +322,7 @@ OverlayCDB::buildRenamePlanLocked(
       continue;
     }
     const bool CommandChanged = Command != OriginalCommand;
-    if (CollidingDestinations.contains(*NewKey)) {
-      Invalidate(Entry.first(), *NewKey);
-      continue;
-    }
-    if (!Plan->Commands.try_emplace(*NewKey, std::move(Command)).second) {
-      Invalidate(Entry.first(), *NewKey);
-      Invalidate(PlannedOrigins.lookup(*NewKey), *NewKey);
-      Plan->Commands.erase(*NewKey);
-      PlannedOrigins.erase(*NewKey);
-      CollidingDestinations.insert(*NewKey);
-      continue;
-    }
-    PlannedOrigins[*NewKey] = Entry.first().str();
-    if (Entry.first() != *NewKey || CommandChanged) {
-      Plan->ChangedFiles.push_back(Entry.first().str());
-      if (Entry.first() != *NewKey)
-        Plan->ChangedFiles.push_back(*NewKey);
-    }
+    AddCommand(Entry.first(), *NewKey, std::move(Command), CommandChanged);
   }
   return Plan;
 }

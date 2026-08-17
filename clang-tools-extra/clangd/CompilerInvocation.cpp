@@ -234,5 +234,63 @@ normalizeCompilerCommand(const tooling::CompileCommand &Command) {
   return Result;
 }
 
+llvm::Expected<tooling::CompileCommand> projectCompileCommandAfterRenames(
+    const tooling::CompileCommand &Original,
+    llvm::ArrayRef<std::pair<Path, Path>> Renames) {
+  auto Normalized = normalizeCompilerCommand(Original);
+  if (!Normalized)
+    return Normalized.takeError();
+  tooling::CompileCommand Command = Original;
+
+  auto Rewrite = [&](const CompilerInputArgument &Span, PathRef NewBase,
+                     PathRef Mapped) {
+    std::string &Argument = Command.CommandLine[Span.ArgumentIndex];
+    llvm::StringRef OldValue(Argument.data() + Span.ValueOffset,
+                             Span.ValueLength);
+    std::string Replacement = Mapped.str();
+    if (!llvm::sys::path::is_absolute(OldValue)) {
+      llvm::SmallString<256> Preserved(NewBase);
+      llvm::sys::path::append(Preserved, OldValue);
+      llvm::sys::path::remove_dots(Preserved, /*remove_dot_dot=*/true);
+      if (pathEqual(Preserved, Mapped))
+        Replacement = OldValue.str();
+      else if (pathEqual(llvm::sys::path::parent_path(Mapped), NewBase))
+        Replacement = llvm::sys::path::filename(Mapped).str();
+    }
+    Argument.replace(Span.ValueOffset, Span.ValueLength, Replacement);
+  };
+
+  auto NewDirectory = mapPathAfterRenames(Command.Directory, Renames);
+  if (!NewDirectory)
+    return NewDirectory.takeError();
+  auto NewEffective =
+      mapPathAfterRenames(Normalized->EffectiveDirectory, Renames);
+  if (!NewEffective)
+    return NewEffective.takeError();
+  for (const CompilerInputArgument &Input : Normalized->Inputs) {
+    auto Mapped = mapPathAfterRenames(Input.AbsolutePath, Renames);
+    if (!Mapped)
+      return Mapped.takeError();
+    Rewrite(Input, *NewEffective, *Mapped);
+  }
+  if (Normalized->WorkingDirectory) {
+    auto Mapped = mapPathAfterRenames(
+        Normalized->WorkingDirectory->AbsolutePath, Renames);
+    if (!Mapped)
+      return Mapped.takeError();
+    Rewrite(*Normalized->WorkingDirectory, *NewDirectory, *Mapped);
+  }
+  if (!Command.Filename.empty()) {
+    Path Filename = absolutePath(Command.Filename, Command.Directory);
+    auto Mapped = mapPathAfterRenames(Filename, Renames);
+    if (!Mapped)
+      return Mapped.takeError();
+    if (!pathEqual(Filename, *Mapped))
+      Command.Filename = *Mapped;
+  }
+  Command.Directory = *NewDirectory;
+  return Command;
+}
+
 } // namespace clangd
 } // namespace clang

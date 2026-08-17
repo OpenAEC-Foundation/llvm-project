@@ -777,7 +777,10 @@ llvm::Error validateContextIncludeGraph(const IncludeGraph &Graph,
       static_cast<uint8_t>(IncludeGraphNode::SourceFlag::HadErrors) |
       static_cast<uint8_t>(
           IncludeGraphNode::SourceFlag::HasConditionalIncludes) |
-      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::IsCommandInput);
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::IsCommandInput) |
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::HasIncludeAliasState) |
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::HasFileQuery) |
+      static_cast<uint8_t>(IncludeGraphNode::SourceFlag::IsModuleMap);
   llvm::StringRef MainURI;
   const FileDigest EmptyDigest{{0}};
   for (const auto &Entry : Graph) {
@@ -820,7 +823,9 @@ llvm::Error validateContextIncludeGraph(const IncludeGraph &Graph,
   };
   Add(MainURI);
   for (const auto &Entry : Graph)
-    if (Entry.getValue().Flags & IncludeGraphNode::SourceFlag::IsCommandInput)
+    if ((Entry.getValue().Flags &
+         IncludeGraphNode::SourceFlag::IsCommandInput) ||
+        (Entry.getValue().Flags & IncludeGraphNode::SourceFlag::IsModuleMap))
       Add(Entry.getKey());
   while (!Pending.empty()) {
     llvm::StringRef URI = Pending.pop_back_val();

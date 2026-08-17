@@ -53,9 +53,7 @@ public:
                           std::vector<int64_t> &RequestedSizes)
       : Base(std::move(Base)), RequestedSizes(RequestedSizes) {}
 
-  llvm::ErrorOr<llvm::vfs::Status> status() override {
-    return Base->status();
-  }
+  llvm::ErrorOr<llvm::vfs::Status> status() override { return Base->status(); }
 
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
   getBuffer(const llvm::Twine &Name, int64_t FileSize,
@@ -100,7 +98,7 @@ private:
     if (!File)
       return File.getError();
     return std::make_unique<BufferSizeRecordingFile>(std::move(*File),
-                                                      RequestedSizes);
+                                                     RequestedSizes);
   }
 };
 
@@ -117,10 +115,11 @@ TEST(FileRename, EnumeratesWorkspaceSourcesAndHeaders) {
       std::string("binary\0incidental include bytes", 31);
   auto VFS = FS.view(std::nullopt);
 
-  auto Files = workspaceSourceFiles(testRoot(), *VFS);
-  ASSERT_THAT_EXPECTED(Files, llvm::Succeeded());
+  WorkspaceSourceCache Cache(testRoot());
+  auto Snapshot = Cache.snapshot(*VFS);
+  ASSERT_THAT_EXPECTED(Snapshot, llvm::Succeeded());
   EXPECT_THAT(
-      *Files,
+      Snapshot->Sources,
       testing::UnorderedElementsAre(
           testing::AllOf(
               testing::Field(&WorkspaceSourceFile::File, testPath("main.cpp")),

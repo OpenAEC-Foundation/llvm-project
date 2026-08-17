@@ -14,11 +14,12 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include <cstdint>
+#include <limits>
 
 namespace clang {
 namespace clangd {
 
-bool fileRenamePathInside(PathRef Ancestor, PathRef Path);
 llvm::Expected<Path> fileRenameCanonicalPath(PathRef Path,
                                              llvm::vfs::FileSystem &FS);
 
@@ -32,8 +33,10 @@ class FileRenameDirectiveCache {
 public:
   explicit FileRenameDirectiveCache(llvm::vfs::FileSystem &FS) : FS(FS) {}
 
+  /// Scans at most MaxBytes, rejecting larger files before opening them.
   llvm::Expected<const FileRenameDirectiveScan *>
-  scan(PathRef File, FileDigest ExpectedDigest);
+  scan(PathRef File, FileDigest ExpectedDigest,
+       uint64_t MaxBytes = std::numeric_limits<uint64_t>::max());
 
 private:
   struct CachedScan {

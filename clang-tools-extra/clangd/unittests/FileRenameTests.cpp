@@ -54,8 +54,9 @@ editsFor(TestTU &TU, llvm::ArrayRef<std::pair<Path, Path>> Renames) {
   }
   return renameIncludeDirectives(
       testPath(TU.Filename), TU.Code, AST->getIncludeStructure(),
-      AST->getPreprocessor().getHeaderSearchInfo(),
-      Inputs.CompileCommand.Directory, Mappings, format::getLLVMStyle(), *VFS);
+      AST->getPreprocessor().getHeaderSearchInfo(), AST->getSourceManager(),
+      AST->getLangOpts(), Inputs.CompileCommand.Directory, Mappings,
+      format::getLLVMStyle(), *VFS);
 }
 
 llvm::Expected<std::vector<TextEdit>> editsFor(TestTU &TU, PathRef Old,
@@ -73,6 +74,18 @@ TEST(FileRename, RenamesQuotedIncludeByResolvedIdentity) {
   ASSERT_EQ(Result->size(), 1u);
   EXPECT_EQ(Result->front().newText, "\"new.h\"");
   EXPECT_EQ(Result->front().range, (Range{{0, 9}, {0, 16}}));
+}
+
+TEST(FileRename, RejectsTrigraphTransformedGeneratedHeaderName) {
+  TestTU TU;
+  TU.Code = "#include \"old.h\"\n";
+  TU.AdditionalFiles["old.h"] = "";
+  TU.ExtraArgs = {"-std=c++14", "-trigraphs"};
+
+  EXPECT_THAT_EXPECTED(editsFor(TU, testPath("old.h"),
+                                testPath("new?"
+                                         "?/name.h")),
+                       llvm::FailedWithMessage(HasSubstr("does not resolve")));
 }
 
 TEST(FileRename, DoesNotRenameAHeaderWithOnlyTheSameSpelling) {
@@ -126,11 +139,10 @@ TEST(FileRename, RejectsDestinationThatShadowsUnchangedInclude) {
   TU.AdditionalFiles["first/unrelated.h"] = "";
   TU.AdditionalFiles["second/current.h"] = "";
   TU.ExtraArgs = {"-I", testPath("first"), "-I", testPath("second")};
-  auto Result = editsFor(
-      TU, testPath("first/unrelated.h"), testPath("first/current.h"));
-  EXPECT_THAT_EXPECTED(
-      Result,
-      llvm::FailedWithMessage(HasSubstr("instead of")));
+  auto Result =
+      editsFor(TU, testPath("first/unrelated.h"), testPath("first/current.h"));
+  EXPECT_THAT_EXPECTED(Result,
+                       llvm::FailedWithMessage(HasSubstr("instead of")));
 }
 
 TEST(FileRename, AllowsShadowThatMovesAwayInSameTransaction) {
@@ -139,9 +151,9 @@ TEST(FileRename, AllowsShadowThatMovesAwayInSameTransaction) {
   TU.AdditionalFiles["first/new.h"] = "";
   TU.AdditionalFiles["second/old.h"] = "";
   TU.ExtraArgs = {"-I", testPath("first"), "-I", testPath("second")};
-  auto Result = editsFor(
-      TU, {{testPath("second/old.h"), testPath("second/new.h")},
-           {testPath("first/new.h"), testPath("first/moved-away.h")}});
+  auto Result =
+      editsFor(TU, {{testPath("second/old.h"), testPath("second/new.h")},
+                    {testPath("first/new.h"), testPath("first/moved-away.h")}});
   ASSERT_THAT_EXPECTED(Result, llvm::Succeeded());
   ASSERT_THAT(*Result, testing::SizeIs(1));
   EXPECT_EQ(Result->front().newText, "<new.h>");
@@ -152,8 +164,8 @@ TEST(FileRename, RejectsInvalidGeneratedHeaderName) {
   TU.Code = "#include \"old.h\"\n";
   TU.AdditionalFiles["old.h"] = "";
   auto Result = editsFor(TU, testPath("old.h"), testPath("new\"name.h"));
-  EXPECT_THAT_EXPECTED(
-      Result, llvm::FailedWithMessage(HasSubstr("header-name token")));
+  EXPECT_THAT_EXPECTED(Result,
+                       llvm::FailedWithMessage(HasSubstr("header-name token")));
 }
 
 TEST(FileRename, RenamesObjCImport) {
@@ -356,15 +368,14 @@ TEST(FileRename, RejectsMovedCompilerConfigurationPaths) {
                                     "-Xclang", "/workspace/config/vfs.yaml"},
            std::vector<std::string>{"clang",
                                     "-fmodule-map-file=/workspace/config"},
-  }) {
+       }) {
     Args.push_back("-c");
     Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
-    EXPECT_THAT_ERROR(
-        validateCompileCommandForRenames(Command, {Rename}),
-        llvm::FailedWithMessage(testing::AnyOf(
-            HasSubstr("compiler path"),
-            HasSubstr("precompiled compiler input"))));
+    EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                      llvm::FailedWithMessage(testing::AnyOf(
+                          HasSubstr("compiler path"),
+                          HasSubstr("precompiled compiler input"))));
   }
 }
 
@@ -439,15 +450,14 @@ TEST(FileRename, RejectsAllIncludeModuleAndVFSCompilerPaths) {
                                     "/workspace/config"},
            std::vector<std::string>{"clang", "-Xclang", "-chain-include",
                                     "-Xclang", "/workspace/config/header.pch"},
-  }) {
+       }) {
     Args.push_back("-c");
     Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
-    EXPECT_THAT_ERROR(
-        validateCompileCommandForRenames(Command, {Rename}),
-        llvm::FailedWithMessage(testing::AnyOf(
-            HasSubstr("compiler path"),
-            HasSubstr("precompiled compiler input"))));
+    EXPECT_THAT_ERROR(validateCompileCommandForRenames(Command, {Rename}),
+                      llvm::FailedWithMessage(testing::AnyOf(
+                          HasSubstr("compiler path"),
+                          HasSubstr("precompiled compiler input"))));
   }
 }
 
@@ -456,9 +466,9 @@ TEST(FileRename, ResolvesIncludePrefixOptionsBeforeValidation) {
   Command.Directory = "/workspace/build";
   Command.Filename = "/workspace/main.cpp";
   for (llvm::StringRef WithPrefix : {"-iwithprefix", "-iwithprefixbefore"}) {
-    Command.CommandLine = {"clang",          "-c",       "-iprefix",
-                           "/workspace/sdk/", WithPrefix.str(), "include",
-                           Command.Filename};
+    Command.CommandLine = {
+        "clang",          "-c",      "-iprefix",      "/workspace/sdk/",
+        WithPrefix.str(), "include", Command.Filename};
     EXPECT_THAT_ERROR(
         validateCompileCommandForRenames(
             Command, {{"/workspace/sdk/include", "/workspace/sdk/renamed"}}),
@@ -477,7 +487,7 @@ TEST(FileRename, ResolvesSysrootSearchOptionsBeforeValidation) {
                                     "-iframeworkwithsysroot", "/include"},
            std::vector<std::string>{"clang", "-isysroot", "/workspace/sdk",
                                     "-I=include"},
-  }) {
+       }) {
     Args.push_back("-c");
     Args.push_back(Command.Filename);
     Command.CommandLine = std::move(Args);
@@ -530,8 +540,7 @@ TEST(FileRename, RejectsCompilerPathAliasingRenamedFile) {
   tooling::CompileCommand Command;
   Command.Directory = Workspace.str().str();
   Command.Filename = FilePath("main.cpp");
-  Command.CommandLine = {"clang", "-c", "-include", Alias,
-                         Command.Filename};
+  Command.CommandLine = {"clang", "-c", "-include", Alias, Command.Filename};
   const std::pair<Path, Path> Rename{Config, Renamed};
 
   EXPECT_THAT_ERROR(
@@ -575,9 +584,8 @@ TEST(FileRename, DetectsConditionalIncludeDirectives) {
   EXPECT_THAT(*Unconditional, testing::IsEmpty());
   auto Guarded = conditionalIncludeDirectives(testPath("guarded.h"), *VFS);
   ASSERT_THAT_EXPECTED(Guarded, llvm::Succeeded());
-  EXPECT_THAT(*Guarded,
-              testing::ElementsAre(testing::Field(
-                  &ConditionalInclusion::Written, "\"ordinary.h\"")));
+  EXPECT_THAT(*Guarded, testing::ElementsAre(testing::Field(
+                            &ConditionalInclusion::Written, "\"ordinary.h\"")));
   auto Nested =
       conditionalIncludeDirectives(testPath("nested-in-guard.h"), *VFS);
   ASSERT_THAT_EXPECTED(Nested, llvm::Succeeded());

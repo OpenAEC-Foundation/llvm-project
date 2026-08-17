@@ -156,8 +156,8 @@ struct WorkspaceSourceCache::Impl {
     const uint64_t BytesToRead =
         NeedsProbe ? std::min(Status.getSize(), BinaryProbeBytes)
                    : Status.getSize();
-    if (auto Err = addToTotal(Usage.ReadBytes, BytesToRead,
-                              Limits.MaxBytesRead, "bytes-read"))
+    if (auto Err = addToTotal(Usage.ReadBytes, BytesToRead, Limits.MaxBytesRead,
+                              "bytes-read"))
       return std::move(Err);
     auto Buffer = NeedsProbe
                       ? FS.getBufferForFile(File, BytesToRead,
@@ -174,8 +174,7 @@ struct WorkspaceSourceCache::Impl {
                    Current.getError().message());
     if (!Current->isRegularFile() || !(metadata(*Current) == Entry.Meta) ||
         Buffer.get()->getBufferSize() < BytesToRead ||
-        (!NeedsProbe &&
-         Buffer.get()->getBufferSize() != Status.getSize()))
+        (!NeedsProbe && Buffer.get()->getBufferSize() != Status.getSize()))
       return error("workspace file changed while being inventoried: {0}", File);
 
     llvm::StringRef Code = Buffer.get()->getBuffer().take_front(BytesToRead);
@@ -520,15 +519,6 @@ void WorkspaceSourceCache::invalidate(PathRef InputPath) {
     return;
   if (State->Invalidated.insert(Normalized).second)
     ++State->Generation;
-}
-
-llvm::Expected<std::vector<WorkspaceSourceFile>>
-workspaceSourceFiles(PathRef WorkspaceRoot, llvm::vfs::FileSystem &FS) {
-  WorkspaceSourceCache Cache(WorkspaceRoot.str());
-  auto Snapshot = Cache.snapshot(FS);
-  if (!Snapshot)
-    return Snapshot.takeError();
-  return std::move(Snapshot->Sources);
 }
 
 } // namespace clangd

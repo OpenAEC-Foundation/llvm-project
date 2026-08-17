@@ -64,7 +64,7 @@ mapPathAfterRenames(PathRef Original,
     llvm::sys::path::remove_dots(NormalizedOld, /*remove_dot_dot=*/true);
     llvm::SmallString<256> NormalizedNew(New);
     llvm::sys::path::remove_dots(NormalizedNew, /*remove_dot_dot=*/true);
-    if (llvm::StringRef(NormalizedOld) == NormalizedNew)
+    if (pathEqual(NormalizedOld, NormalizedNew))
       continue;
     bool IsDescendant = llvm::sys::path::is_absolute(NormalizedOld) &&
                         llvm::sys::path::is_absolute(NormalizedOriginal) &&
@@ -79,7 +79,7 @@ mapPathAfterRenames(PathRef Original,
                               llvm::sys::path::relative_path(Suffix));
     llvm::sys::path::remove_dots(Rewritten, /*remove_dot_dot=*/true);
     Path Candidate = Rewritten.str().str();
-    if (Result && *Result != Candidate)
+    if (Result && !pathEqual(*Result, Candidate))
       return llvm::createStringError(
           llvm::formatv("overlapping file renames map {0} to both {1} and {2}",
                         Original, *Result, Candidate)

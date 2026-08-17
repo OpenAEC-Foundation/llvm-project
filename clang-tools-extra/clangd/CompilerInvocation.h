@@ -13,6 +13,7 @@
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/Support/Error.h"
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -36,6 +37,16 @@ struct NormalizedCompilerCommand {
 
 llvm::Expected<NormalizedCompilerCommand>
 normalizeCompilerCommand(const tooling::CompileCommand &Command);
+
+/// Rewrites the paths that identify a compile command and its sole source
+/// input as they will appear after \p Renames.
+///
+/// This preserves relative source and working-directory spellings whenever
+/// they still resolve to the mapped paths. The command must be accepted by
+/// normalizeCompilerCommand().
+llvm::Expected<tooling::CompileCommand> projectCompileCommandAfterRenames(
+    const tooling::CompileCommand &Command,
+    llvm::ArrayRef<std::pair<Path, Path>> Renames);
 
 CompilerInvocationMode
 compilerInvocationMode(llvm::ArrayRef<std::string> CommandLine);

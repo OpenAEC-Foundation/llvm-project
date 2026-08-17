@@ -33,12 +33,19 @@ TEST(SerializationTest, ContextSourcesRoundTripAndRejectsUnknownSchema) {
   Main.Digest = digest("main");
   Main.DirectIncludes = {"file:///workspace/common.h"};
   Main.Flags |= IncludeGraphNode::SourceFlag::IsTU;
+  Main.Flags |= IncludeGraphNode::SourceFlag::HasIncludeAliasState;
+  Main.Flags |= IncludeGraphNode::SourceFlag::HasFileQuery;
   Context[Main.URI] = Main;
   IncludeGraphNode Header;
   Header.URI = "file:///workspace/common.h";
   Header.Digest = digest("header");
   Header.Flags |= IncludeGraphNode::SourceFlag::HasConditionalIncludes;
   Context[Header.URI] = Header;
+  IncludeGraphNode ModuleMap;
+  ModuleMap.URI = "file:///external/include/module.modulemap";
+  ModuleMap.Digest = digest("module map");
+  ModuleMap.Flags |= IncludeGraphNode::SourceFlag::IsModuleMap;
+  Context[ModuleMap.URI] = ModuleMap;
 
   IndexFileOut Out;
   Out.Symbols = &Symbols;
@@ -51,11 +58,17 @@ TEST(SerializationTest, ContextSourcesRoundTripAndRejectsUnknownSchema) {
   ASSERT_TRUE(bool(RoundTrip)) << RoundTrip.takeError();
   ASSERT_TRUE(RoundTrip->ContextSources);
   EXPECT_THAT(RoundTrip->ContextSources->keys(),
-              UnorderedElementsAre(Main.URI, Header.URI));
+              UnorderedElementsAre(Main.URI, Header.URI, ModuleMap.URI));
   EXPECT_THAT(RoundTrip->ContextSources->lookup(Main.URI).DirectIncludes,
               ElementsAre(Header.URI));
   EXPECT_TRUE(RoundTrip->ContextSources->lookup(Header.URI).Flags &
               IncludeGraphNode::SourceFlag::HasConditionalIncludes);
+  EXPECT_TRUE(RoundTrip->ContextSources->lookup(Main.URI).Flags &
+              IncludeGraphNode::SourceFlag::HasIncludeAliasState);
+  EXPECT_TRUE(RoundTrip->ContextSources->lookup(Main.URI).Flags &
+              IncludeGraphNode::SourceFlag::HasFileQuery);
+  EXPECT_TRUE(RoundTrip->ContextSources->lookup(ModuleMap.URI).Flags &
+              IncludeGraphNode::SourceFlag::IsModuleMap);
   ASSERT_TRUE(RoundTrip->CC1CommandLine);
   EXPECT_THAT(*RoundTrip->CC1CommandLine,
               testing::ElementsAreArray(CC1Command));

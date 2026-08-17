@@ -10,12 +10,24 @@
 #include "FileRenameInternal.h"
 #include "SourceCode.h"
 #include "support/Logger.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticIDs.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/Basic/LangOptions.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Basic/TargetInfo.h"
+#include "clang/Basic/TargetOptions.h"
 #include "clang/Lex/DependencyDirectivesScanner.h"
 #include "clang/Lex/Lexer.h"
+#include "clang/Lex/LiteralSupport.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/TargetParser/Host.h"
+#include <cstdint>
+#include <limits>
+#include <memory>
 
 namespace clang {
 namespace clangd {
@@ -27,19 +39,67 @@ struct ScannedDependencyDirectives {
   llvm::SmallVector<dependency_directives_scan::Directive> Directives;
 };
 
+llvm::Expected<std::string>
+decodeStringLiteralTokens(llvm::ArrayRef<Token> Tokens, bool Trigraphs) {
+  auto DiagIDs = llvm::makeIntrusiveRefCnt<DiagnosticIDs>();
+  DiagnosticOptions DiagOpts;
+  DiagnosticsEngine Diags(DiagIDs, DiagOpts, new IgnoringDiagConsumer(),
+                          /*ShouldOwnClient=*/true);
+  FileSystemOptions FSOpts;
+  FileManager Files(FSOpts);
+  SourceManager Sources(Diags, Files);
+  TargetOptions TargetOpts;
+  TargetOpts.Triple = llvm::sys::getDefaultTargetTriple();
+  auto Target = TargetInfo::CreateTargetInfo(Diags, TargetOpts);
+  if (!Target)
+    return error("cannot create target for string-literal decoding");
+  LangOptions LangOpts;
+  LangOpts.CPlusPlus = true;
+  LangOpts.Trigraphs = Trigraphs;
+  StringLiteralParser Parser(Tokens, Sources, LangOpts, *Target);
+  if (Parser.hadError || !Parser.isOrdinary())
+    return error("cannot decode inline assembly string-literal sequence");
+  return Parser.GetString().str();
+}
+
 llvm::Expected<std::unique_ptr<ScannedDependencyDirectives>>
-scanDependencyDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
-  auto Buffer = FS.getBufferForFile(File);
+scanDependencyDirectives(PathRef File, llvm::vfs::FileSystem &FS,
+                         uint64_t MaxBytes) {
+  auto Initial = FS.status(File);
+  if (!Initial)
+    return error("cannot inspect dependency directives in {0}: {1}", File,
+                 Initial.getError().message());
+  if (!Initial->isRegularFile())
+    return error("dependency directive input is not a regular file: {0}", File);
+  if (Initial->getSize() > MaxBytes)
+    return error("dependency directive input {0} is {1} bytes, exceeding the "
+                 "{2}-byte scan limit",
+                 File, Initial->getSize(), MaxBytes);
+  if (Initial->getSize() >
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return error("dependency directive input is too large to read: {0}", File);
+  auto Buffer =
+      FS.getBufferForFile(File, static_cast<int64_t>(Initial->getSize()),
+                          /*RequiresNullTerminator=*/true, /*IsVolatile=*/true,
+                          /*IsText=*/false);
   if (!Buffer)
     return error("cannot read dependency directives from {0}: {1}", File,
                  Buffer.getError().message());
+  auto Current = FS.status(File);
+  if (!Current || !Current->isRegularFile() ||
+      Current->getUniqueID() != Initial->getUniqueID() ||
+      Current->getLastModificationTime() !=
+          Initial->getLastModificationTime() ||
+      Current->getSize() != Initial->getSize() ||
+      Buffer.get()->getBufferSize() != Initial->getSize())
+    return error("dependency directive input changed while being read: {0}",
+                 File);
   auto Result = std::make_unique<ScannedDependencyDirectives>();
   Result->Buffer = std::move(*Buffer);
   if (scanSourceForDependencyDirectives(Result->Buffer->getBuffer(),
-                                        Result->Tokens,
-                                        Result->Directives)) {
-    if (llvm::sys::path::filename(File) != "module.map" &&
-        llvm::sys::path::extension(File) != ".modulemap")
+                                        Result->Tokens, Result->Directives)) {
+    if (!pathEqual(llvm::sys::path::filename(File), "module.map") &&
+        !pathEqual(llvm::sys::path::extension(File), ".modulemap"))
       return error("cannot scan dependency directives in {0}", File);
     // Module-map syntax is not preprocessor syntax. Its file dependencies are
     // handled by the raw lexer below, and partial scanner output is unusable.
@@ -52,8 +112,9 @@ scanDependencyDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
 void scanUneditablePreprocessorQueries(
     llvm::ArrayRef<dependency_directives_scan::Directive> Directives,
     llvm::StringRef Code, FileRenameDirectiveScan &Result) {
-  auto HeaderSpelling = [&](llvm::ArrayRef<dependency_directives_scan::Token>
-                                Tokens) -> llvm::StringRef {
+  auto HeaderSpelling =
+      [&](llvm::ArrayRef<dependency_directives_scan::Token> Tokens)
+      -> llvm::StringRef {
     for (const auto &Token : Tokens)
       if (Token.Kind == tok::header_name)
         return Code.slice(Token.Offset, Token.getEnd());
@@ -100,8 +161,8 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
     PragmaDependencyPath,
   };
   State ScanState = State::None;
-  bool ModuleMap = llvm::sys::path::filename(File) == "module.map" ||
-                   llvm::sys::path::extension(File) == ".modulemap";
+  bool ModuleMap = pathEqual(llvm::sys::path::filename(File), "module.map") ||
+                   pathEqual(llvm::sys::path::extension(File), ".modulemap");
   bool ModuleHeaderPath = false;
   bool ModuleUmbrellaPath = false;
   bool ModuleExternPath = false;
@@ -119,17 +180,25 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
       ScanState = State::AfterHash;
       continue;
     }
+    if (Token.is(tok::hashhash)) {
+      Result.UneditableDependencies.push_back(
+          {"macro token-pasting construct", {}});
+      continue;
+    }
     if (Token.is(tok::raw_identifier)) {
       llvm::StringRef Name = Token.getRawIdentifier();
-      if (Name == "_Pragma") {
-        ScanState = State::AfterPragma;
+      if (Name == "_Pragma" || Name == "__pragma") {
+        // The operand may itself be produced by macro expansion. The raw
+        // dependency scan cannot prove the pragma text in that case.
+        Result.UneditableDependencies.push_back({"_Pragma dependency", {}});
+        ScanState = State::None;
         continue;
       }
       switch (ScanState) {
       case State::AfterHash:
         if (Name == "embed")
           Result.UneditableDependencies.push_back({"#embed directive", {}});
-        ScanState = Name == "embed" ? State::EmbedPath
+        ScanState = Name == "embed"    ? State::EmbedPath
                     : Name == "pragma" ? State::AfterPragma
                                        : State::None;
         break;
@@ -139,8 +208,8 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
                         : State::None;
         break;
       case State::AfterPragmaVendor:
-        ScanState = Name == "dependency" ? State::PragmaDependencyPath
-                                          : State::None;
+        ScanState =
+            Name == "dependency" ? State::PragmaDependencyPath : State::None;
         break;
       default:
         break;
@@ -160,9 +229,6 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
       else if (ScanState == State::PragmaDependencyPath)
         Result.UneditableDependencies.push_back(
             {"dependency pragma", Written.str()});
-      else if (ScanState == State::AfterPragma &&
-               Written.contains("dependency"))
-        Result.UneditableDependencies.push_back({"_Pragma dependency", {}});
       if (ModuleMap &&
           (ModuleHeaderPath || ModuleUmbrellaPath || ModuleExternPath))
         Result.UneditableDependencies.push_back(
@@ -180,8 +246,7 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
   llvm::StringRef Extension = llvm::sys::path::extension(File);
   bool AssemblySource = Extension.equals_insensitive(".s") ||
                         Extension.equals_insensitive(".asm");
-  if (AssemblySource &&
-      (Code.contains(".incbin") || Code.contains(".include")))
+  if (AssemblySource && (Code.contains(".incbin") || Code.contains(".include")))
     Result.UneditableDependencies.push_back({"assembly file directive", {}});
 
   enum class AsmState { None, AwaitingArguments, Arguments };
@@ -191,6 +256,7 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
   bool SawLiteralTemplate = false;
   bool UnprovenTemplate = false;
   bool HasFileDirective = false;
+  llvm::SmallVector<clang::Token> AsmLiterals;
   Lexer AsmLexer(SourceLocation(), LangOpts, Code.begin(), Code.begin(),
                  Code.end());
   do {
@@ -207,6 +273,7 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
       SawLiteralTemplate = false;
       UnprovenTemplate = false;
       HasFileDirective = false;
+      AsmLiterals.clear();
       continue;
     }
     if (InlineAsm == AsmState::AwaitingArguments) {
@@ -231,6 +298,23 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
     }
     if (Token.is(tok::r_paren)) {
       if (--AsmDepth == 0) {
+        if (!UnprovenTemplate && SawLiteralTemplate) {
+          auto Literal = decodeStringLiteralTokens(AsmLiterals, false);
+          auto TrigraphLiteral = decodeStringLiteralTokens(AsmLiterals, true);
+          if (!Literal || !TrigraphLiteral) {
+            if (!Literal)
+              llvm::consumeError(Literal.takeError());
+            if (!TrigraphLiteral)
+              llvm::consumeError(TrigraphLiteral.takeError());
+            UnprovenTemplate = true;
+          } else {
+            HasFileDirective =
+                llvm::StringRef(*Literal).contains(".incbin") ||
+                llvm::StringRef(*Literal).contains(".include") ||
+                llvm::StringRef(*TrigraphLiteral).contains(".incbin") ||
+                llvm::StringRef(*TrigraphLiteral).contains(".include");
+          }
+        }
         if (HasFileDirective || UnprovenTemplate || !SawLiteralTemplate)
           Result.UneditableDependencies.push_back(
               {"unproven inline assembly dependency", {}});
@@ -246,24 +330,18 @@ void scanRawDependencies(PathRef File, llvm::StringRef Code,
     }
     if (Token.is(tok::string_literal)) {
       SawLiteralTemplate = true;
-      llvm::StringRef Literal(Token.getLiteralData(), Token.getLength());
-      HasFileDirective |=
-          Literal.contains(".incbin") || Literal.contains(".include");
+      AsmLiterals.push_back(Token);
     } else {
       UnprovenTemplate = true;
     }
   } while (true);
 }
 
-} // namespace
-
 llvm::Expected<FileRenameDirectiveScan>
-scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
-  auto Scan = scanDependencyDirectives(File, FS);
-  if (!Scan)
-    return Scan.takeError();
-  const auto &Directives = (*Scan)->Directives;
-  llvm::StringRef Code = (*Scan)->Buffer->getBuffer();
+buildDirectiveScan(PathRef File,
+                   std::unique_ptr<ScannedDependencyDirectives> Scan) {
+  const auto &Directives = Scan->Directives;
+  llvm::StringRef Code = Scan->Buffer->getBuffer();
   FileRenameDirectiveScan Result;
   Result.Contents = Code.str();
   Result.Digest = digest(Code);
@@ -341,8 +419,20 @@ scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   return Result;
 }
 
+} // namespace
+
+llvm::Expected<FileRenameDirectiveScan>
+scanFileRenameDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
+  auto Scan =
+      scanDependencyDirectives(File, FS, std::numeric_limits<uint64_t>::max());
+  if (!Scan)
+    return Scan.takeError();
+  return buildDirectiveScan(File, std::move(*Scan));
+}
+
 llvm::Expected<const FileRenameDirectiveScan *>
-FileRenameDirectiveCache::scan(PathRef File, FileDigest ExpectedDigest) {
+FileRenameDirectiveCache::scan(PathRef File, FileDigest ExpectedDigest,
+                               uint64_t MaxBytes) {
   auto Canonical = fileRenameCanonicalPath(File, FS);
   if (!Canonical)
     return Canonical.takeError();
@@ -354,7 +444,10 @@ FileRenameDirectiveCache::scan(PathRef File, FileDigest ExpectedDigest) {
                    File);
     return &Existing->getValue().Scan;
   }
-  auto Result = scanFileRenameDirectives(File, FS);
+  auto Scan = scanDependencyDirectives(File, FS, MaxBytes);
+  if (!Scan)
+    return Scan.takeError();
+  auto Result = buildDirectiveScan(File, std::move(*Scan));
   if (!Result)
     return Result.takeError();
   if (Result->Digest != ExpectedDigest)
@@ -371,14 +464,6 @@ conditionalIncludeDirectives(PathRef File, llvm::vfs::FileSystem &FS) {
   if (!Scan)
     return Scan.takeError();
   return std::move(Scan->ConditionalIncludes);
-}
-
-llvm::Expected<bool> hasIncludeDirectives(PathRef File,
-                                          llvm::vfs::FileSystem &FS) {
-  auto Scan = scanFileRenameDirectives(File, FS);
-  if (!Scan)
-    return Scan.takeError();
-  return Scan->HasIncludeDirectives;
 }
 
 } // namespace clangd
